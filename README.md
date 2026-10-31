@@ -435,22 +435,37 @@ Response on a confirmed scam — `reply` is what the decoy said:
   "sessionId": "wertyu-dfghj-ertyui",
   "reply": "Haan beta, I want to do it, but my app is asking for an account number. Which number should I type?",
   "action": "decoy_engaged",
-  "guardian": {
-    "stage": "engage",
-    "scamDetected": true,
-    "confidence": 0.75,
-    "scamType": "bank_fraud",
-    "hasHardSignal": true,
-    "handedOffThisTurn": true,
-    "signals": [
-      { "id": "otp_or_pin_request", "hard": true, "weight": 0.45,
-        "description": "Asks for an OTP, PIN, CVV or password" },
-      { "id": "urgency_pressure", "hard": false, "weight": 0.15,
-        "description": "Artificial deadline or final-warning framing" },
-      { "id": "account_threat", "hard": false, "weight": 0.15,
-        "description": "Threatens that an account or service will be blocked" }
-    ]
+  "state": "DECOY_ACTIVE",
+  "takeoverNotice": {
+    "en": "Guardian has taken over this conversation. You don't need to reply.",
+    "mr": "गार्डियनने हे संभाषण ताब्यात घेतले आहे. तुम्हाला उत्तर देण्याची गरज नाही."
   },
+  "guardian": {
+    "state": "DECOY_ACTIVE",
+    "previousState": "SUSPICIOUS",
+    "takeover": true,
+    "trustedContact": false,
+    "score": 85,
+    "breakdown": [
+      { "id": "credential_request", "label": "Credential request", "weight": 35, "hard": true,
+        "description": "Asks for an OTP, PIN, CVV, password or card number" },
+      { "id": "threat", "label": "Threat", "weight": 25, "hard": false,
+        "description": "Threatens arrest, legal action, or an immediate cut-off" },
+      { "id": "authority_claim", "label": "Authority claim", "weight": 15, "hard": false,
+        "description": "Claims to be a bank, government body, courier or telecom" },
+      { "id": "urgency", "label": "Urgency", "weight": 10, "hard": false,
+        "description": "Imposes an artificial deadline" }
+    ],
+    "hardSignals": ["credential_request"],
+    "classifier": { "label": "scam", "reasons": ["demands an OTP"], "available": true },
+    "thresholds": { "decoy": 60, "suspicious": 30, "release": 30 },
+    "scamType": "bank_fraud",
+    "decisionMs": 2
+  },
+  "alerts": [
+    { "audience": "user", "kind": "takeover_notice", "severity": "info",
+      "text": { "en": "Guardian has taken over...", "mr": "गार्डियनने..." } }
+  ],
   "decoy": { "askedFor": "bankAccounts", "source": "llm", "violations": [] },
   "scriptStages": {
     "thisMessage": [
@@ -489,8 +504,11 @@ Response on a confirmed scam — `reply` is what the decoy said:
 `GET /api/sessions/:sessionId` returns the same session with its full `entities`
 array, the accumulated `scriptStages`, and each message's own stage tags.
 
-On a legitimate caller, `reply` is `null` and `action` is `monitoring`. The
-assessment is still returned, so the console can show *why* nothing happened.
+`reply` is what the counterpart receives, and it is `null` in every state
+except `DECOY_ACTIVE`. The assessment comes back either way, so the console can
+show *why* nothing happened, and `alerts` carries what the protected user and a
+family contact are shown — bilingual, and the family one always marked
+`simulated: true`, because nothing is actually delivered to anyone.
 
 ### Other routes
 
@@ -659,6 +677,22 @@ Four more were found while building the replacement:
 digital-arrest script through the finished pipeline: it reached 0.50 and stalled
 at `WATCH` despite naming a mule account. The Guardian now also scores script
 stage signals, which are tagged in all three languages.
+
+**Two states where there should have been six.** The original had
+`scamDetected` as a boolean, so there was no way to express "suspicious but
+unproven" — every conversation was either ignored or baited. That is the root of
+the false-positive problem, not the regexes. There are now six states, and only
+one of them lets the decoy speak.
+
+**No way for the user to say no.** The original had no concept of the protected
+user at all: no trusted contacts, no override, no warning. A wrong call could
+only be discovered by reading the logs afterwards. There are now five
+independent guards against baiting a real caller, and the user can end an
+engagement with one button.
+
+**A score with no provenance.** `confidenceLevel` was a single number from the
+model with nothing behind it. It is now a sum of named weights, and every
+response carries the breakdown that produced it.
 
 ### Still carried over, deliberately
 
