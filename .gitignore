@@ -1,0 +1,21 @@
+# Secrets - never commit these
+.env
+.env.*
+!.env.example
+keys.txt
+keys*.txt
+*.pem
+*.key
+
+node_modules/
+npm-debug.log*
+*.log
+
+# mongodb-memory-server binary cache
+.cache/
+.mongodb-binaries/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

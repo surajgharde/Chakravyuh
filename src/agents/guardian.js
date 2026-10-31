@@ -1,0 +1,307 @@
+/**
+ * Guardian agent - watches the conversation and decides whether the decoy
+ * takes over.
+ *
+ * Detection is two layers:
+ *   1. A deterministic signal table (below). Each rule that fires contributes a
+ *      fixed, documented weight. This runs with no LLM key and no network.
+ *   2. An optional LLM verdict on intent, which can only nudge the score.
+ *
+ * `confidence` is the sum of those weights, clamped to 0..1. No part of it is
+ * invented by the model and it never starts from a floor.
+ *
+ * Three outcomes, so a legitimate caller is never baited:
+ *   PASS    - nothing to act on; the decoy is not involved.
+ *   WATCH   - suspicious but unproven; keep listening, still no bait.
+ *   ENGAGE  - hand off to the decoy.
+ *
+ * ENGAGE additionally requires at least one HARD signal, so urgency or worry
+ * alone - which a real bank or hospital call also carries - cannot trigger it.
+ */
+
+const logger = require('../services/logger');
+const { LLM_ERROR_CODES } = require('../llm/errors');
+
+const STAGES = { PASS: 'pass', WATCH: 'watch', ENGAGE: 'engage' };
+
+// A signal is HARD when, on its own, it has no routine legitimate explanation.
+const SIGNALS = [
+    {
+        id: 'otp_or_pin_request',
+        hard: true,
+        weight: 0.45,
+        description: 'Asks for an OTP, PIN, CVV or password',
+        test: (t) => /\b(otp|one[\s-]?time[\s-]?password|pin|cvv|card\s*number|password|passcode)\b/i.test(t)
+            && /\b(share|send|sent|tell|give|provide|enter|type|confirm|read|forward|need|what\s+is)\b/i.test(t),
+    },
+    {
+        id: 'remote_access_request',
+        hard: true,
+        weight: 0.40,
+        description: 'Asks to install an app or grant screen/remote access',
+        test: (t) => /\b(anydesk|teamviewer|quicksupport|apk|screen[\s-]?shar\w*|remote\s*access)\b/i.test(t)
+            || /\b(install|download)\b[^.?]{0,30}\b(app|apk|file|software|tool)\b/i.test(t),
+    },
+    {
+        id: 'arrest_or_legal_threat',
+        hard: true,
+        weight: 0.40,
+        description: 'Threatens arrest, FIR or legal action to force compliance',
+        test: (t) => /\b(arrest|warrant|fir|non[\s-]?bailable|custody|court\s*case|digital\s*arrest|cbi|narcotics)\b/i.test(t)
+            || /\bcustoms\b[^.?]{0,30}\b(seiz\w*|parcel|held)\b/i.test(t),
+    },
+    {
+        id: 'payment_redirect',
+        hard: true,
+        weight: 0.35,
+        description: 'Directs money to an account, UPI id or wallet',
+        test: (t) => /\b(transfer|send|deposit|pay|remit|credit)\b[^.?]{0,60}\b(upi|account|a\/c|wallet|bitcoin|usdt|qr|scan)\b/i.test(t)
+            || /\b(upi\s*id|account\s*number|a\/c\s*no)\b[^.?]{0,20}[:\-]/i.test(t),
+    },
+    {
+        id: 'credential_phishing_link',
+        hard: true,
+        weight: 0.30,
+        description: 'Link paired with a verification or login instruction',
+        test: (t) => /https?:\/\/\S+/i.test(t)
+            && /\b(verify|verification|kyc|update|re[\s-]?activat\w*|login|log\s*in|unblock|claim|confirm)\b/i.test(t),
+    },
+
+    {
+        id: 'urgency_pressure',
+        hard: false,
+        weight: 0.15,
+        description: 'Artificial deadline or final-warning framing',
+        test: (t) => /\b(immediately|right\s+now|today\s+itself|last\s+warning|final\s+notice)\b/i.test(t)
+            || /\bwithin\s+\d+\s*(min\w*|hour\w*|hrs)\b/i.test(t)
+            || /\bexpir\w*\s+(today|now|in)\b/i.test(t),
+    },
+    {
+        id: 'secrecy_instruction',
+        hard: false,
+        weight: 0.20,
+        description: 'Tells the target to keep it secret or stay on the line',
+        test: (t) => /\b(do\s*n.?t\s+(tell|inform|disconnect|hang\s*up|cut)|without\s+telling|keep\s+(this|it)\s+(secret|confidential)|stay\s+on\s+the\s+(line|call))\b/i.test(t),
+    },
+    {
+        id: 'authority_claim',
+        hard: false,
+        weight: 0.15,
+        description: 'Unverified claim to represent a bank, telecom or government body',
+        test: (t) => /\b(i\s+am|this\s+is|calling\s+from|on\s+behalf\s+of)\b[^.?]{0,40}\b(sbi|hdfc|icici|axis|kotak|bank|rbi|trai|income\s+tax|police|cyber\s*(cell|crime)|department|electricity\s+board|government)\b/i.test(t),
+    },
+    {
+        id: 'account_threat',
+        hard: false,
+        weight: 0.15,
+        description: 'Threatens that an account or service will be blocked',
+        test: (t) => /\b(block\w*|suspend\w*|deactivat\w*|freez\w*|terminat\w*|disconnect\w*)\b[^.?]{0,40}\b(account|number|sim|connection|card|service|kyc)\b/i.test(t)
+            || /\b(account|kyc|sim|card)\b[^.?]{0,40}\b(block\w*|suspend\w*|deactivat\w*|freez\w*)\b/i.test(t),
+    },
+    {
+        id: 'prize_lure',
+        hard: false,
+        weight: 0.20,
+        description: 'Unsolicited prize, refund, cashback or guaranteed return',
+        test: (t) => /\b(you\s+have\s+won|congratulations|lucky\s+winner|lottery|jackpot|cashback|guaranteed\s+return|double\s+your|claim\s+your)\b/i.test(t)
+            || /\brefund\b[^.?]{0,20}\b(pending|approved|ready|initiated)\b/i.test(t),
+    },
+    {
+        id: 'fee_before_benefit',
+        hard: false,
+        weight: 0.20,
+        description: 'Asks for a fee, charge or tax before releasing a benefit',
+        test: (t) => /\b(processing\s+fee|service\s+charge|clearance\s+fee|security\s+deposit|registration\s+(fee|amount)|refundable\s+amount)\b/i.test(t),
+    },
+];
+
+// Signals that point the other way. A legitimate caller tends to produce these.
+const EXCULPATORY = [
+    {
+        id: 'explicit_no_otp_advisory',
+        weight: -0.35,
+        description: 'States that it will never ask for an OTP or PIN - standard bank advisory',
+        test: (t) => /\b(never\s+(ask|share|request)|will\s+not\s+ask|do\s+not\s+share|no\s+one\s+from)\b[^.?]{0,40}\b(otp|pin|cvv|password)\b/i.test(t),
+    },
+    {
+        id: 'verifiable_callback_offered',
+        weight: -0.20,
+        description: 'Invites the target to call the official number on their card or website',
+        test: (t) => /\b(number\s+(printed\s+)?on\s+(your|the)\s+card|nearest\s+branch|official\s+website|toll[\s-]?free\s+number)\b/i.test(t)
+            || /\bcall\s+(us\s+)?back\s+on\s+the\s+(number|helpline)\b/i.test(t),
+    },
+];
+
+const WEIGHTS = {
+    // The LLM can move the score, but never decide alone.
+    llmScam: 0.20,
+    llmLegitimate: -0.30,
+    volunteeredIdentifier: 0.10,
+};
+
+const THRESHOLDS = {
+    engage: 0.60, // plus at least one hard signal
+    watch: 0.25,
+};
+
+const clamp01 = (n) => Math.min(1, Math.max(0, n));
+const round2 = (n) => Math.round(n * 100) / 100;
+
+/** Maps a confidence to a stage. ENGAGE additionally requires a hard signal. */
+const stageFor = (confidence, hasHardSignal) => {
+    if (confidence >= THRESHOLDS.engage && hasHardSignal) return STAGES.ENGAGE;
+    if (confidence >= THRESHOLDS.watch) return STAGES.WATCH;
+    return STAGES.PASS;
+};
+
+/** Runs the deterministic layer over the scammer-side text of a session. */
+const scoreSignals = (text) => {
+    const fired = [];
+    let score = 0;
+
+    for (const signal of [...SIGNALS, ...EXCULPATORY]) {
+        if (signal.test(text)) {
+            fired.push({
+                id: signal.id,
+                hard: Boolean(signal.hard),
+                weight: signal.weight,
+                description: signal.description,
+            });
+            score += signal.weight;
+        }
+    }
+
+    return { score, fired };
+};
+
+const CLASSIFIER_PROMPT = `You are a fraud analyst protecting an elderly person in India.
+You receive the incoming side of a conversation. Judge the SENDER's intent.
+
+Reply with JSON only:
+{
+  "intent": "scam" | "legitimate" | "unclear",
+  "scamType": "bank_fraud" | "upi_fraud" | "digital_arrest" | "phishing" | "investment_scam" | "advance_fee_fraud" | "job_scam" | "lottery_scam" | "tech_support_scam" | "unknown",
+  "rationale": "one short sentence citing what the sender actually said"
+}
+
+Rules:
+- "legitimate" is a real answer. Delivery agents, pharmacies, clinics, relatives
+  and genuine bank advisories are legitimate even when they sound urgent.
+- Judge only what the sender said. Do not assume fraud because you were asked.
+- Answer "unclear" when there is not enough to decide.`;
+
+/**
+ * Asks the LLM for an intent verdict. Never throws: a failed or absent LLM
+ * leaves detection running on the deterministic layer alone.
+ */
+const classifyWithLlm = async (llm, conversationText) => {
+    if (!llm || !llm.configured) {
+        return { intent: 'unavailable', scamType: 'unknown', rationale: 'LLM not configured.' };
+    }
+
+    try {
+        const verdict = await llm.completeJson({
+            messages: [
+                { role: 'system', content: CLASSIFIER_PROMPT },
+                { role: 'user', content: conversationText },
+            ],
+            temperature: 0,
+            maxTokens: 200,
+        });
+
+        const intent = ['scam', 'legitimate', 'unclear'].includes(verdict && verdict.intent)
+            ? verdict.intent
+            : 'unclear';
+
+        return {
+            intent,
+            scamType: typeof verdict?.scamType === 'string' ? verdict.scamType : 'unknown',
+            rationale: typeof verdict?.rationale === 'string' ? verdict.rationale : '',
+        };
+    } catch (error) {
+        if (error.code !== LLM_ERROR_CODES.NOT_CONFIGURED) {
+            logger.warn(`Guardian classifier unavailable (${error.code}); using rules only.`);
+        }
+        return { intent: 'unavailable', scamType: 'unknown', rationale: `Classifier unavailable: ${error.code}` };
+    }
+};
+
+/**
+ * Assesses a session.
+ *
+ * @param {object}   params
+ * @param {string}   params.incomingText          the newest scammer-side message
+ * @param {object[]} params.priorScammerMessages  earlier scammer-side messages
+ * @param {object}   params.llm                   LlmClient, or null
+ * @param {object}   params.extracted             output of the identifier extractor
+ */
+const assess = async ({ incomingText, priorScammerMessages = [], llm = null, extracted = null }) => {
+    // Signals are scored over the whole scammer side: tactics build up across turns.
+    const corpus = [...priorScammerMessages.map((m) => m.text), incomingText].join('\n');
+
+    const { score: ruleScore, fired } = scoreSignals(corpus);
+    let score = ruleScore;
+
+    // An identifier the sender volunteered is corroboration, not a tactic on its own.
+    const volunteered = Boolean(extracted
+        && (extracted.upiIds.length || extracted.bankAccounts.length || extracted.phishingLinks.length));
+
+    if (volunteered) {
+        score += WEIGHTS.volunteeredIdentifier;
+        fired.push({
+            id: 'volunteered_identifier',
+            hard: false,
+            weight: WEIGHTS.volunteeredIdentifier,
+            description: 'Sender volunteered a payment identifier or link',
+        });
+    }
+
+    const hasHardSignal = fired.some((s) => s.hard);
+
+    // Staged deliberately in two steps so the demo can show what the rules
+    // alone concluded and what the classifier then did to that conclusion.
+    const ruleConfidence = clamp01(score);
+    const ruleStage = stageFor(ruleConfidence, hasHardSignal);
+
+    const llmVerdict = await classifyWithLlm(llm, corpus);
+    if (llmVerdict.intent === 'scam') score += WEIGHTS.llmScam;
+    if (llmVerdict.intent === 'legitimate') score += WEIGHTS.llmLegitimate;
+
+    const confidence = clamp01(score);
+    let stage = stageFor(confidence, hasHardSignal);
+
+    // An explicit "legitimate" verdict vetoes hand-off outright, even if the
+    // rules still add up: missing a scam costs less than baiting a real caller.
+    if (llmVerdict.intent === 'legitimate') {
+        if (stage === STAGES.ENGAGE) stage = STAGES.WATCH;
+        if (ruleStage === STAGES.ENGAGE) {
+            fired.push({
+                id: 'handoff_blocked_by_classifier',
+                hard: false,
+                weight: 0,
+                description: 'Classifier judged the sender legitimate; hand-off withheld',
+            });
+        }
+    }
+
+    const scamType = extracted && extracted.scamType && extracted.scamType !== 'unknown'
+        ? extracted.scamType
+        : llmVerdict.scamType;
+
+    return {
+        stage,
+        isScam: stage === STAGES.ENGAGE,
+        confidence: round2(confidence),
+        // What the deterministic layer concluded on its own, before the classifier.
+        ruleConfidence: round2(ruleConfidence),
+        ruleStage,
+        hasHardSignal,
+        signals: fired,
+        signalIds: fired.map((s) => s.id),
+        scamType: scamType || 'unknown',
+        classifier: llmVerdict,
+        rationale: fired.length ? fired.map((s) => s.description).join('; ') : 'No scam signals fired.',
+    };
+};
+
+module.exports = { assess, scoreSignals, classifyWithLlm, STAGES, SIGNALS, EXCULPATORY, THRESHOLDS, WEIGHTS };
