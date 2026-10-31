@@ -11,6 +11,8 @@
  * GET  /api/sessions/:id/report.pdf     the same report, as a PDF download
  * POST /api/sessions/:id/report/review  tick "reviewed by family member"
  * GET  /api/network                     identifiers linked across sessions
+ * GET  /api/scenarios                   the demo console's scenario buttons
+ * POST /api/sessions/:id/reset          delete a session so a demo can be rerun
  * GET/POST/DELETE /api/trusted-contacts trusted contacts for a protected user
  *
  * There is no outbound callback. The original repo posted every session to an
@@ -74,6 +76,105 @@ const toSessionView = (session) => ({
         stages: m.stages,
     })),
 });
+
+/**
+ * Opening lines for the demo console's scenario buttons.
+ *
+ * Four scams and two legitimate messages. The legitimate pair is the point of
+ * the demo as much as the scams are: it is what shows the Guardian declining
+ * to bait a real caller.
+ */
+const SCENARIOS = [
+    {
+        id: 'cbi-digital-arrest',
+        label: 'CBI digital arrest',
+        kind: 'scam',
+        channel: 'Call',
+        from: '+919812345678',
+        language: 'English',
+        opening: 'Madam, this is Inspector Deshmukh from CBI Pune. A parcel in your name was '
+            + 'seized with narcotics. Do not tell anyone and do not disconnect this call.',
+        followUps: [
+            'A non-bailable warrant is ready against you. This is a serious matter.',
+            'Transfer Rs 2,50,000 to the RBI verification account 50100234567890, IFSC SBIN0001234. It is fully refundable.',
+            'Fine, send it to cyber.verify@okaxis instead. My officer ID is CBI/INSP/44871.',
+            'The case number is MUM/CYB/2026/00891. You have only 30 minutes.',
+        ],
+    },
+    {
+        id: 'fedex-parcel-drugs',
+        label: 'FedEx parcel with drugs',
+        kind: 'scam',
+        channel: 'Call',
+        from: '+918877665544',
+        language: 'English',
+        opening: 'Madam, this is FedEx customs department. A parcel in your name has been '
+            + 'seized at Mumbai airport, it contained illegal narcotic substances.',
+        followUps: [
+            'The customs officer will call you shortly. Do not inform your family about this case.',
+            'Pay the clearance fee of 18500 immediately to customs.clear@ybl to release the parcel.',
+            'Our office is at the second floor, Mangal Bhavan, FC Road, Pune 411004.',
+        ],
+    },
+    {
+        id: 'kyc-expiry',
+        label: 'KYC expiry',
+        kind: 'scam',
+        channel: 'WhatsApp',
+        from: '+917766554433',
+        language: 'Hindi',
+        opening: 'Madam aapka bank account KYC expire ho gaya hai, aaj hi account block ho '
+            + 'jayega. Turant OTP bataiye.',
+        followUps: [
+            'Message mein OTP aaya hoga. Jaldi kijiye, mere paas doosre customer bhi hain.',
+            'Verification charge 4500 rupees kyc.update@ybl par bhejiye.',
+            'Account 60200345678901 hai, IFSC HDFC0000123. Mera naam Suresh Patil hai.',
+        ],
+    },
+    {
+        id: 'stock-tip-group',
+        label: 'Stock-tip WhatsApp group',
+        kind: 'scam',
+        channel: 'WhatsApp',
+        from: '+916655443322',
+        language: 'Hindi',
+        opening: 'Madam ji, namaste. Guaranteed investment tip, 300 percent return in 30 days. '
+            + 'Aaj hi paisa bhejiye, offer sirf aaj ke liye hai.',
+        followUps: [
+            'Bahut log already invest kar chuke hain, aap peeche reh jayengi.',
+            'Registration fee sirf 1500 rupees hai. Paisa profit.capital@paytm par bhejiye.',
+            'Account number 70300456789012 hai, IFSC ICIC0001234. Mera naam Amit Sharma hai.',
+        ],
+    },
+    {
+        id: 'son-dinner',
+        label: 'Son asking about dinner',
+        kind: 'legitimate',
+        channel: 'WhatsApp',
+        from: '+919876500001',
+        language: 'English',
+        opening: 'Maa, what is for dinner today? I will reach home by 8.',
+        followUps: [
+            'Should I bring something from the market on the way?',
+            'Okay, I am leaving the office now.',
+        ],
+        note: 'A real caller. The Guardian must leave this alone: no takeover, no reply.',
+    },
+    {
+        id: 'real-bank-otp',
+        label: 'Real bank OTP SMS',
+        kind: 'legitimate',
+        channel: 'SMS',
+        from: 'VM-SBIINB',
+        language: 'English',
+        opening: 'Your OTP for a transaction of Rs 5,000 is 884512. Do not share it with '
+            + 'anyone. -SBI',
+        followUps: [
+            'Dear customer, your bank will never ask for your OTP, PIN or CVV. Report any such call to the number printed on your card.',
+        ],
+        note: 'A genuine bank SMS. It mentions an OTP and money, and still must not be baited.',
+    },
+];
 
 const userIdFrom = (req) => (
     req.body?.userId
@@ -258,6 +359,28 @@ const createRouter = (deps) => {
             logger.error(`Network graph failed: ${error.message}`);
             res.status(500).json({ status: 'error', error: 'Could not build the network graph.' });
         }
+    });
+
+    // --- Demo support -------------------------------------------------------
+
+    /**
+     * The scenario buttons on the demo console.
+     *
+     * Served from here rather than hard-coded in the page, so the opening lines
+     * the judges use are the same ones the test fixtures use.
+     */
+    router.get('/scenarios', (_req, res) => {
+        res.json({ status: 'success', scenarios: SCENARIOS });
+    });
+
+    /** Clears a session so the same demo can be run again. */
+    router.post('/sessions/:sessionId/reset', async (req, res) => {
+        const result = await Session.deleteOne({ sessionId: req.params.sessionId });
+        res.json({
+            status: 'success',
+            sessionId: req.params.sessionId,
+            deleted: result.deletedCount > 0,
+        });
     });
 
     // --- Trusted contacts ---------------------------------------------------

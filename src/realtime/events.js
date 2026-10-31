@@ -10,6 +10,15 @@
  *   guardian.state_changed  a state machine transition
  *   guardian.takeover       the decoy has taken the conversation over
  *   guardian.released       the decoy has let go, or was never engaged
+ *
+ * Plus one transport event for the console:
+ *
+ *   session.turn            the whole completed turn
+ *
+ * The four guardian events are the agent's own decisions. session.turn exists
+ * so a second screen showing only the intelligence panel can stay live without
+ * having sent the message itself - without it, that screen would see scores
+ * change but never learn what was extracted.
  */
 
 const EVENTS = {
@@ -17,6 +26,7 @@ const EVENTS = {
     STATE_CHANGED: 'guardian.state_changed',
     TAKEOVER: 'guardian.takeover',
     RELEASED: 'guardian.released',
+    TURN: 'session.turn',
 };
 
 /** Discards everything. Used when no transport is wired up. */

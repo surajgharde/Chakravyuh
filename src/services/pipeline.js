@@ -19,6 +19,7 @@ const intelligence = require('../agents/intelligence');
 const stages = require('./stages');
 const logger = require('./logger');
 const trustedContacts = require('./trustedContacts');
+const { EVENTS } = require('../realtime/events');
 const { normalizeMessage, normalizeHistory } = require('./normalize');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -249,7 +250,7 @@ const handleTurn = async (body, deps = {}) => {
     const typingDelayMs = decoyResult ? decoyResult.typingDelayMs : 0;
     if (typingDelayMs > 0) await sleep(typingDelayMs);
 
-    return {
+    const result = {
         sessionId,
         // What the counterpart receives. Null unless the decoy is engaged.
         reply: decoyResult ? decoyResult.reply : null,
@@ -312,6 +313,17 @@ const handleTurn = async (body, deps = {}) => {
             ? session.intelligence.toObject()
             : session.intelligence,
     };
+
+    // The console listens for this so a second screen stays live.
+    if (events) {
+        events.emit(EVENTS.TURN, {
+            ...result,
+            incoming: { messageId, role: incoming.role, text: incoming.text, at: receivedAt.toISOString() },
+            at: new Date().toISOString(),
+        });
+    }
+
+    return result;
 };
 
 /**
