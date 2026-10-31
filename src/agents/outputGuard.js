@@ -77,29 +77,34 @@ const RULES = [
  * @returns {{verdict: string, text: string, violations: object[]}}
  */
 const review = (draft, context = {}) => {
-    let text = String(draft ?? '').trim();
+    const original = String(draft ?? '').trim();
+    let text = original;
     const violations = [];
 
     if (text === '') {
         return { verdict: VERDICTS.BLOCK, text: '', violations: [{ id: 'empty', reason: 'The draft was empty.' }] };
     }
 
+    // Every rule is tested against the ORIGINAL draft, not against a partly
+    // substituted one. Cascading the substitutions meant a draft that broke two
+    // rules only ever reported the first, which under-reports what went wrong.
+    const fired = [];
     for (const rule of RULES) {
-        let fired = false;
         try {
-            fired = Boolean(rule.test(text));
+            if (rule.test(original)) fired.push(rule);
         } catch (error) {
             logger.warn(`outputGuard rule ${rule.id} threw: ${error.message}`);
         }
-        if (!fired) continue;
-
-        violations.push({ id: rule.id, reason: rule.reason });
-
-        if (rule.substitute === null) {
-            return { verdict: VERDICTS.BLOCK, text: '', violations };
-        }
-        text = rule.substitute;
     }
+
+    for (const rule of fired) violations.push({ id: rule.id, reason: rule.reason });
+
+    // Anything unsubstitutable blocks the whole reply; otherwise the first
+    // matching rule's safe line is what goes out.
+    if (fired.some((rule) => rule.substitute === null)) {
+        return { verdict: VERDICTS.BLOCK, text: '', violations };
+    }
+    if (fired.length > 0) text = fired[0].substitute;
 
     // A spoken reply is one or two short sentences. Anything longer reads as
     // written rather than said.

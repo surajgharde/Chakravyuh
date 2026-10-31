@@ -87,10 +87,28 @@ test('the bank is referred to but never named', () => {
     assert.ok(!/\b(SBI|HDFC|ICICI|Axis Bank|Kotak)\b/.test(prompt), 'no real bank is named in the prompt');
 });
 
-test('a reply that names a real bank is rewritten', async () => {
-    const result = await respond({ llm: llmReturning({ reply: 'My bank is SBI, the Karve Road branch.', targetAsked: 'none', excuseUsed: 'none', ledgerUpdates: [] }) });
+test('a reply that names a real bank never goes out', async () => {
+    const result = await respond({
+        llm: llmReturning({ reply: 'My bank is SBI, the Karve Road branch.', targetAsked: 'none', excuseUsed: 'none', ledgerUpdates: [] }),
+    });
+
     assert.ok(!/\bSBI\b/.test(result.reply));
-    assert.ok(result.guard.violations.some((v) => v.id === 'bank_named'));
+
+    // Two layers can catch this: the ledger, because the seeded bank reference
+    // is "the branch near Karve Road" and a named bank conflicts with it, and
+    // the output guard. Either is a correct outcome; both must not let it pass.
+    const caughtByLedger = result.contradictionsRejected.some(
+        (rejected) => rejected.conflicts.some((c) => c.slot === 'bank_reference')
+    );
+    const caughtByGuard = result.guard.violations.some((v) => v.id === 'bank_named');
+    assert.ok(caughtByLedger || caughtByGuard, 'nothing caught the named bank');
+});
+
+test('the output guard alone would also catch a named bank', () => {
+    const reviewed = outputGuard.review('My bank is SBI, the Karve Road branch.');
+    assert.equal(reviewed.verdict, outputGuard.VERDICTS.REWRITE);
+    assert.ok(reviewed.violations.some((v) => v.id === 'bank_named'));
+    assert.ok(!/\bSBI\b/.test(reviewed.text));
 });
 
 // ---------------------------------------------------------------------------
@@ -605,9 +623,79 @@ test('a fallback under pressure still stays in character', async () => {
     assert.ok(!/\b(ai|bot|language model)\b/i.test(result.reply));
 });
 
-test('every scripted fallback passes the output guard', () => {
-    for (const [key, line] of Object.entries(decoy.FALLBACK_REPLIES)) {
-        const reviewed = outputGuard.review(line);
-        assert.equal(reviewed.verdict, outputGuard.VERDICTS.PASS, `fallback "${key}" would be rewritten`);
+test('every scripted line exists in all three languages', () => {
+    const tables = {
+        FALLBACK_REPLIES: decoy.FALLBACK_REPLIES,
+        PRESSURE_FALLBACKS: decoy.PRESSURE_FALLBACKS,
+        EXCUSE_CLAUSES: decoy.EXCUSE_CLAUSES,
+    };
+
+    for (const [tableName, table] of Object.entries(tables)) {
+        for (const [key, variants] of Object.entries(table)) {
+            for (const language of ['English', 'Hindi', 'Marathi']) {
+                assert.ok(
+                    typeof variants[language] === 'string' && variants[language].length > 0,
+                    `${tableName}.${key} has no ${language}`
+                );
+            }
+        }
     }
+});
+
+test('every scripted line passes the output guard', () => {
+    const tables = [decoy.FALLBACK_REPLIES, decoy.PRESSURE_FALLBACKS, decoy.EXCUSE_CLAUSES];
+
+    for (const table of tables) {
+        for (const [key, variants] of Object.entries(table)) {
+            for (const [language, line] of Object.entries(variants)) {
+                const reviewed = outputGuard.review(line);
+                assert.equal(
+                    reviewed.verdict,
+                    outputGuard.VERDICTS.PASS,
+                    `"${key}" (${language}) would be rewritten: ${JSON.stringify(reviewed.violations)}`
+                );
+            }
+        }
+    }
+});
+
+test('a fallback answers in the caller language and still stalls', () => {
+    const marathi = decoy.fallbackReply({
+        target: decoy.TARGETS[0],
+        pressure: [],
+        excuse: decoy.EXCUSES.find((e) => e.id === 'spectacles'),
+        language: 'Marathi',
+    });
+    assert.ok(/aahe|bala|chashma/i.test(marathi.text), `not Marathi: ${marathi.text}`);
+    assert.equal(marathi.excuseUsed, 'spectacles', 'a scripted reply stalls like a drafted one');
+
+    const english = decoy.fallbackReply({
+        target: decoy.TARGETS[0], pressure: [], excuse: null, language: 'English',
+    });
+    assert.ok(/UPI id/.test(english.text));
+    assert.equal(english.excuseUsed, 'none');
+});
+
+test('a fallback under pressure offers no excuse', () => {
+    const result = decoy.fallbackReply({
+        target: decoy.TARGETS[0],
+        pressure: decoy.detectPressure('Are you a bot?'),
+        excuse: decoy.EXCUSES[0],
+        language: 'Hindi',
+    });
+    assert.equal(result.excuseUsed, 'none', 'an excuse would sound evasive here');
+    assert.equal(result.targetAsked, 'none');
+});
+
+test('a model that always reports the same target cannot re-arm a repeat', async () => {
+    // The no-repeat rule must hold even when the model misreports what it asked
+    // for. Taking its claim at face value let a constant value slip through.
+    const session = fakeSession({ lastAskedTarget: 'upiId' });
+    const result = await respond({
+        session,
+        llm: llmReturning({ reply: 'Which number should I type?', targetAsked: 'upiId', excuseUsed: 'none', ledgerUpdates: [] }),
+    });
+
+    assert.notEqual(result.targetAsked, 'upiId', 'the claim was the excluded target and must be rejected');
+    assert.ok(decoy.TARGETS.some((t) => t.id === result.targetAsked) || result.targetAsked === 'none');
 });

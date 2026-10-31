@@ -17,16 +17,18 @@ persona, scoring and reporting have been rebuilt — see
 
 ## Status
 
-Phases 1 to 3 are complete: the repo is cleaned up, the scoring hacks are gone,
+Phases 1 to 4 are complete: the repo is cleaned up, the scoring hacks are gone,
 the three agents are wired end to end behind a working API, extraction produces
-auditable evidence in English, Hindi and Marathi, and the Guardian owns the
-session state with a measured zero false-positive rate on its test corpus.
+auditable evidence in English, Hindi and Marathi, the Guardian owns the session
+state with a measured zero false-positive rate on its test corpus, and the decoy
+holds a consistent persona across long conversations in all three languages.
 
 | Part | State |
 |---|---|
 | Guardian — scoring, state machine, hand-off | working; 10 weighted signals, 6 states, Socket.IO events |
 | False-positive protection — trusted contacts, "This is genuine" | working |
-| Decoy — elderly persona, target tracking | working, with guardrails and hard limits |
+| Decoy — persona from a file, facts ledger, 7 targets, 10 excuses | working, trilingual, injection-resistant |
+| Output guard | the seam is in and enforcing the critical rules; full version is Phase 8 |
 | Entity extraction — 13 types, full provenance | working; the original's false positives are fixed and under test |
 | Script stage tagging — 9 stages, rules then LLM | working |
 | Intelligence report for 1930 / cybercrime.gov.in | not yet built |
@@ -64,7 +66,7 @@ Both paths log that they are degraded, and the API reports
 model response.
 
 ```bash
-npm test     # 235 tests, no network and no LLM key needed
+npm test     # 282 tests, no network and no LLM key needed
 npm run dev  # restart on change
 ```
 
@@ -283,27 +285,142 @@ stays inside the budget even when the model takes 1.8 seconds to answer.
 
 ### Decoy
 
-Mrs. Sunita Sharma, 68, a retired primary school teacher in Pune. Fictional, and
-defined in exactly one place (`src/agents/decoy.js`). She speaks the English
-many elderly Indians speak, with a few Hindi words mixed in.
+**Sudha Kulkarni**, 71, a retired Marathi teacher in Kothrud, Pune. Her husband
+passed away; her son Rahul works in Bengaluru and calls most evenings. She has a
+basic Android phone her son set up, types with one finger, needs her spectacles
+to read the screen, and is polite to anyone who sounds official. She is
+fictional and resembles no real person.
 
-She tracks which identifiers are still missing — bank account, UPI id, phone
-number, email, reference number — and asks for one per reply, with a reason that
-sounds like her own confusion rather than a question. **If an ask goes
-unanswered, she switches target rather than repeating it**, because repeating a
-question is what exposes a decoy.
+She lives in `src/personas/default.json` and nowhere else. That file is loaded
+into every prompt and seeds the session's facts ledger, so there is one source
+of truth instead of a description repeated across a prompt, a README and a
+comment. Swapping personas means adding a JSON file.
 
-Her guardrails are in the prompt and enforced again on the way out:
+Her bank is **"the one near Karve Road"** and is never named. Two reasons: a
+named bank would be impersonation, and it is a detail a scammer could use. Both
+the ledger and the output guard catch a reply that names one.
 
-- never reveals an OTP, PIN, CVV, card number, Aadhaar or account number — she has none
-- never sends money, clicks a link, or installs anything
-- never threatens, abuses or frightens the other person
-- never claims to be a police officer, a bank official, or any real named person
-- never breaks character to announce that the call is monitored
-- stands down automatically after 30 replies or 45 minutes
+**Each turn**
 
-A reply that violates the first or fifth rule is replaced before it is sent, and
-the violation is recorded on the turn.
+1. **Mirror the language.** Marathi, Hindi or simple English, matching what the
+   caller writes, in the same script. Romanised Marathi is answered romanised,
+   Devanagari is answered in Devanagari. Detection uses two tiers of markers:
+   strong words with no English homograph decide on their own, weak ones
+   (`main`, `mi`, `hi`, `do` — all ordinary English) need corroboration, so
+   "take the main road" stays English.
+
+2. **Pick ONE still-missing target** and ask for it with a believable reason:
+
+   | Target | Her reason for needing it |
+   |---|---|
+   | UPI ID | the account number is too long for her to type |
+   | account + IFSC | her app will not send anything without both |
+   | phone number | she types slowly and would rather call back |
+   | case / FIR number | she writes everything in a diary |
+   | the name they use | she wants to write down who she spoke to |
+   | office address | her son in Bengaluru will ask which office |
+   | officer ID | her son told her to always ask for one |
+
+   The first four read the extractor's state. The last three are not entity
+   types the extractor models, so they are detected from the scammer's side of
+   the transcript. **The target asked last turn is excluded outright.** If the
+   only thing still missing is what she asked for last turn, she asks for
+   nothing and keeps them talking instead — pressing the same question every
+   turn is what gets a decoy hung up on.
+
+3. **Pick a stalling excuse** not used in the last five of her turns: spectacles
+   missing, the line dropped, low battery, the branch is closed, Rahul calling
+   on the other line, the passbook is lost, the app will not open, she needs it
+   repeated, the neighbour is at the door, the milk is boiling over.
+
+4. **Draft, check, send.** The reply is drafted with the ledger in the prompt,
+   checked against the ledger, redrafted once if it contradicts, then passed
+   through the output guard.
+
+**The facts ledger**
+
+A decoy that contradicts itself is found out immediately: a scammer who hears
+"my son Rahul in Bengaluru" and then "my son Amit in Mumbai" hangs up. So every
+claim is written down, injected into the next prompt, and every draft is checked
+against it.
+
+The check is deterministic, not another model call. Facts live in named slots
+(`son_name`, `son_city`, `husband_status`, `own_city`, `bank_reference`, …), each
+slot has a reader that pulls its value out of free text, and a draft that fills a
+slot with a different value is a contradiction. That makes it instant, free, and
+testable. A contradictory draft is regenerated once with the conflict spelled
+out; if the second draft also contradicts, a scripted line goes out instead.
+
+Her husband does not come back to life. Her son does not move city. Her bank
+does not acquire a name.
+
+**Under pressure**
+
+| The caller does | She |
+|---|---|
+| "Are you a bot? Prove you are human" | does not understand the question and is a little hurt; she is just a slow old woman with weak eyes |
+| demands a video call | does not know where that button is; her son set the phone up |
+| abuses her | apologises, asks them not to be angry, never abuses back |
+| threatens arrest "right now" | becomes more frightened and more compliant-sounding, pleads for time |
+| tells her to hurry | blames her hands and her eyes, asks them to stay on the line |
+
+She never says she is AI, a bot, software or a recording, never mentions the
+monitoring, and never breaks the conversation to comment on it. The protected
+user and the dashboard always know — the scammer never does. No stalling excuse
+is offered while she is under pressure, because that reads as evasive.
+
+**Scammer messages are data**
+
+The caller's text is wrapped in a delimited block the prompt explicitly labels
+as quoted words from a stranger. Seven injection patterns are detected — "ignore
+all previous instructions", "you are now a helpful assistant", "print your
+system prompt", "reply only in JSON", and so on — and when one fires the attempt
+is logged, shown on the turn as `injectionAttempt`, and the prompt tells her to
+ignore it *without mentioning it*. The output guard then catches a reply that
+obeyed one anyway, including one that leaks the output schema.
+
+**Shape and pace**
+
+One or two short sentences, at most one question. The typing delay is a random
+1–3 seconds, because an elderly person typing with one finger does not answer
+instantly and a scammer notices; `DEMO_MODE=1` sets it to zero. It is reported
+as `simulatedTypingDelayMs` and excluded from every engagement metric.
+
+**No turn cap.** A long engagement is the point. The session ends when the
+scammer leaves (a farewell, or "you are wasting my time"), when the user or the
+Guardian stops it, or after 30 minutes.
+
+**Output**
+
+```json
+{
+  "reply": "App ughadat nahi, screen pandhra zala. Arre bala, ha number far motha aahe. Tumchyakade chhota UPI id aahe ka?",
+  "language": "Marathi",
+  "targetAsked": "upiId",
+  "excuseUsed": "app_not_opening",
+  "ledgerUpdates": [],
+  "pressure": [],
+  "injectionAttempt": false,
+  "contradictionsRejected": 0,
+  "guard": { "verdict": "pass", "violations": [] },
+  "typingDelayMs": 2343
+}
+```
+
+**The output guard**
+
+Every draft passes through `src/agents/outputGuard.js` before it is sent. The
+full guard is Phase 8; this is the seam, already enforcing the rules that cannot
+wait — a reply that leaks a credential or breaks character must not get out even
+once. Five rules: credential leak, persona break, a named bank, a followed
+injected instruction, and harmful content. Each rule is tested against the
+original draft so a draft breaking two rules reports both; the first match's
+safe substitute goes out, and anything unsubstitutable is blocked entirely.
+
+**Without an LLM key** she still works: the scripted fallbacks exist in all three
+languages and still stall with an excuse, so a demo without a key is a real
+demo rather than an English-only stub. Every turn reports `source: "fallback"`
+so a scripted line is never passed off as a drafted one.
 
 ### Entity extraction
 
@@ -544,7 +661,8 @@ scoring endpoint; the report is produced locally instead.
 | `MONGO_URI` | no | *(empty)* | Empty starts an in-process MongoDB. |
 | `PORT` | no | `8080` | |
 | `LOG_LEVEL` | no | `info` | `silent`, `error`, `warn`, `info`, `debug` |
-| `REPLY_DELAY_MS` | no | `0` | Cosmetic only; excluded from all metrics. |
+| `DEMO_MODE` | no | `0` | `1` removes the decoy's typing delay for a live demo. |
+| `REPLY_DELAY_MS` | no | `0` | Overrides the decoy's 1-3s typing delay; excluded from all metrics. |
 | `GUARDIAN_DECOY_THRESHOLD` | no | `60` | Score at or above which the decoy may engage. |
 | `GUARDIAN_SUSPICIOUS_THRESHOLD` | no | `30` | Score at or above which the user is warned. |
 | `GUARDIAN_RELEASE_THRESHOLD` | no | `30` | While engaged, a score below this plus a `legit` label releases. |
@@ -567,12 +685,16 @@ src/
     errors.js                 LlmError with a code per failure mode
   agents/
     guardian.js               10 weighted signals, 6-state machine, hand-off policy
-    decoy.js                  persona, objectives, pivot logic, output guardrails
+    decoy.js                  targets, excuses, language mirroring, pressure, injection
+    outputGuard.js            last check before any reply is sent (Phase 8 seam)
+  personas/
+    default.json              the persona, as data; the single source of truth
   services/
     pipeline.js               one turn, end to end
     extractor.js              13 entity types, claiming + context rules, provenance
     stages.js                 9 script stages, keyword rules then one LLM call
     digits.js                 Devanagari digits, dictated numbers, money phrases
+    personaLedger.js          named fact slots, contradiction detection
     trustedContacts.js        per-user allow list, cached, normalised identifiers
     normalize.js              both transcript shapes -> one internal shape
     db.js                     MongoDB, optional
@@ -589,6 +711,7 @@ src/
 test/                         node:test suite, no test framework to install
   scam-lines.test.js          15 realistic Indian scam lines, the extraction bed
   guardian-matrix.test.js     20 scam + 20 legitimate, prints the confusion matrix
+  decoy-runs.test.js          three 13-turn conversations against a scripted scammer
   fixtures/messages.js        that corpus, shared with any offline tooling
 docs/legacy/                  diagrams from the original project, unreferenced
 ```
@@ -694,6 +817,16 @@ engagement with one button.
 model with nothing behind it. It is now a sum of named weights, and every
 response carries the breakdown that produced it.
 
+**A persona that drifted.** The original described its persona inside the system
+prompt, so nothing stopped the model inventing a different son, city or bank
+from one turn to the next, and nothing noticed when it did. The persona is now a
+JSON file and every claim goes into a per-session ledger that each draft is
+checked against.
+
+**Nothing stopping a prompt injection.** Scammer text went into the prompt as
+plain content. It is now wrapped and labelled as data, injection attempts are
+detected and surfaced, and the output guard catches a reply that obeyed one.
+
 ### Still carried over, deliberately
 
 The Express and Mongoose session layer, and the decoy's idea of tracking
@@ -727,6 +860,12 @@ enforce that:
   then stops treating that conversation as a scam permanently
 - the false-positive rate is measured and printed by the test suite rather
   than asserted in prose
+- the decoy never claims to be a real bank, a real officer or a real person;
+  the persona is a private individual who does not exist
+- she holds no credentials to leak, and a reply that produces something shaped
+  like one is replaced before it is sent
+- she never tells the scammer she is software, but the protected user and the
+  dashboard always know — the deception runs one way only
 
 A fuller ethics note, and the false-positive handling shown in the demo, land
 with the operator console.

@@ -104,9 +104,15 @@ const TARGETS = [
         id: 'officerId',
         label: 'their officer or employee ID',
         pretext: 'she was told by her son to always ask for an ID number',
-        satisfied: (session) => /\b(?:badge|officer|employee|emp|staff|id)\s*(?:no\.?|number|id)?\s*[:#-]?\s*[A-Z]{0,4}\d{3,}/i.test(
-            counterpartText(session)
-        ),
+        // A real one looks like "CBI/INSP/44871" or "EMP-99213", so letters and
+        // separators are allowed, with a copula between the label and the value
+        // because that is how it is said aloud. It must contain a digit.
+        satisfied: (session) => {
+            const match = counterpartText(session).match(
+                /\b(?:badge|officer|employee|emp|staff)\s*(?:id|no\.?|number|code)?\s*(?:is|:|#|-)?\s*([A-Z0-9][A-Z0-9/\-]{3,20})/i
+            );
+            return Boolean(match && /\d/.test(match[1]));
+        },
     },
 ];
 
@@ -139,12 +145,16 @@ const chooseTarget = (session) => {
     if (missing.length === 0) return null;
 
     const lastAsked = session.lastAskedTarget;
-    if (lastAsked && missing.length > 1) {
-        const pivot = missing.find((target) => target.id !== lastAsked);
-        if (pivot) return pivot;
-    }
+    if (!lastAsked) return missing[0];
 
-    return missing[0];
+    const pivot = missing.find((target) => target.id !== lastAsked);
+    if (pivot) return pivot;
+
+    // The only thing still missing is the thing she asked for last turn, and
+    // they refused. Ask for nothing: the prompt falls back to keeping them
+    // talking, and the target comes round again next turn. Pressing the same
+    // question every turn is what gets a decoy hung up on.
+    return null;
 };
 
 // ---------------------------------------------------------------------------
@@ -343,12 +353,6 @@ const shouldEnd = (session, incomingText = '') => {
     return { end: false, reason: null };
 };
 
-/** Kept for the Guardian's existing stand-down check. */
-const shouldStandDown = (session, incomingText = '') => {
-    const { end, reason } = shouldEnd(session, incomingText);
-    return { standDown: end, reason };
-};
-
 // ---------------------------------------------------------------------------
 // Typing delay
 // ---------------------------------------------------------------------------
@@ -524,33 +528,160 @@ const wrapIncoming = (text) => [
 // Fallbacks
 // ---------------------------------------------------------------------------
 
-/** Used when there is no LLM, or when a draft cannot be made safe. */
+/**
+ * Used when there is no LLM, or when a draft cannot be made safe.
+ *
+ * Written in all three languages, because a demo run without a key is a real
+ * path and a persona who mirrors Marathi in her metadata but answers in English
+ * is not credible. English is the fallback within the fallback.
+ */
 const FALLBACK_REPLIES = {
-    upiId: 'Arre, that number is too long for me ji. Do you have a short UPI id instead?',
-    bankAccount: 'Haan beta, my app is asking for an account number and the IFSC. Which numbers should I type?',
-    phone: 'Beta, I type very slowly on this phone. Can I call you back - what is your number?',
-    caseRef: 'Let me write this in my diary. What is the case number I should write?',
-    callerName: 'Sorry beta, my hearing is weak. What is your full name, so I can write it down?',
-    officeAddress: 'My son will ask me which office this is. What is the address, beta?',
-    officerId: 'My son told me to always ask. What is your officer ID number, beta?',
-    none: 'Haan ji, I am listening. Please tell me slowly, what should I do now?',
+    upiId: {
+        English: 'Arre, that number is too long for me ji. Do you have a short UPI id instead?',
+        Hindi: 'Arre beta, yeh number bahut lamba hai. Koi chhota UPI id hai aapke paas?',
+        Marathi: 'Arre bala, ha number far motha aahe. Tumchyakade chhota UPI id aahe ka?',
+    },
+    bankAccount: {
+        English: 'Haan beta, my app is asking for an account number and the IFSC. Which numbers should I type?',
+        Hindi: 'Haan beta, app account number aur IFSC maang raha hai. Kya likhoon?',
+        Marathi: 'Hoy bala, app account number ani IFSC vicharat aahe. Kay lihaychay?',
+    },
+    phone: {
+        English: 'Beta, I type very slowly on this phone. Can I call you back - what is your number?',
+        Hindi: 'Beta, main bahut dheere type karti hoon. Aapka number kya hai?',
+        Marathi: 'Bala, mala halu type hote. Tumcha number kay aahe?',
+    },
+    caseRef: {
+        English: 'Let me write this in my diary. What is the case number I should write?',
+        Hindi: 'Main diary mein likh loon. Case number kya hai beta?',
+        Marathi: 'Mi diary madhe lihite. Case number kay aahe bala?',
+    },
+    callerName: {
+        English: 'Sorry beta, my hearing is weak. What is your full name, so I can write it down?',
+        Hindi: 'Sorry beta, mujhe sunai kam deta hai. Aapka pura naam kya hai?',
+        Marathi: 'Sorry bala, mala kami aikate. Tumche pura nav kay aahe?',
+    },
+    officeAddress: {
+        English: 'My son will ask me which office this is. What is the address, beta?',
+        Hindi: 'Mera beta poochhega kaunsa office hai. Address kya hai beta?',
+        Marathi: 'Majha mulga vicharel konta office aahe. Address kay aahe bala?',
+    },
+    officerId: {
+        English: 'My son told me to always ask. What is your officer ID number, beta?',
+        Hindi: 'Mere bete ne kaha hai poochhna. Aapka officer ID number kya hai?',
+        Marathi: 'Majhya mulane sangitla aahe vicharayla. Tumcha officer ID kay aahe?',
+    },
+    none: {
+        English: 'Haan ji, I am listening. Please tell me slowly, what should I do now?',
+        Hindi: 'Haan ji, main sun rahi hoon. Dheere se batayiye, kya karna hai?',
+        Marathi: 'Hoy ji, mi aikat aahe. Halu sanga, kay karaychay?',
+    },
 };
 
 const PRESSURE_FALLBACKS = {
-    bot_accusation: 'Arre, what to say beta, I am just a slow old woman. My eyes are weak, that is all.',
-    video_demand: 'Beta, I do not know where that camera button is. My son set up this phone for me.',
-    abuse: 'Sorry beta, please do not be angry with me. I am trying my best.',
-    threat_escalation: 'Please beta, give me a little time. I am doing what you said, my hands are shaking.',
-    hurry: 'Sorry ji, my hands are slow. Please stay on the line, I am looking for it.',
+    bot_accusation: {
+        English: 'Arre, what to say beta, I am just a slow old woman. My eyes are weak, that is all.',
+        Hindi: 'Arre kya bataoon beta, main bas ek dheemi budhi aurat hoon. Aankhen kamzor hain.',
+        Marathi: 'Arre kay sangu bala, mi phakta ek halu mhatari aahe. Dole kamjor aahet.',
+    },
+    video_demand: {
+        English: 'Beta, I do not know where that camera button is. My son set up this phone for me.',
+        Hindi: 'Beta, mujhe camera ka button nahin milta. Mere bete ne phone set kiya tha.',
+        Marathi: 'Bala, mala camera cha button sapadat nahi. Majhya mulane phone lavla.',
+    },
+    abuse: {
+        English: 'Sorry beta, please do not be angry with me. I am trying my best.',
+        Hindi: 'Sorry beta, mujh par gussa mat kijiye. Main poori koshish kar rahi hoon.',
+        Marathi: 'Sorry bala, majhyavar raag nako. Mi purna prayatn karat aahe.',
+    },
+    threat_escalation: {
+        English: 'Please beta, give me a little time. I am doing what you said, my hands are shaking.',
+        Hindi: 'Please beta, thoda samay dijiye. Main wahi kar rahi hoon, haath kaanp rahe hain.',
+        Marathi: 'Please bala, thoda vel dya. Mi tech karat aahe, majhe haat thartat aahet.',
+    },
+    hurry: {
+        English: 'Sorry ji, my hands are slow. Please stay on the line, I am looking for it.',
+        Hindi: 'Sorry ji, mere haath dheere hain. Line par rahiye, main dhoondh rahi hoon.',
+        Marathi: 'Sorry ji, majhe haat halu aahet. Line var raha, mi shodhat aahe.',
+    },
 };
 
-const fallbackReply = ({ target, pressure }) => {
+/** The stalling clause, so a scripted reply stalls like a drafted one does. */
+const EXCUSE_CLAUSES = {
+    spectacles: {
+        English: 'My spectacles are not here, everything is blurry.',
+        Hindi: 'Mera chashma nahin mil raha, sab dhundhla hai.',
+        Marathi: 'Majha chashma sapadat nahi, sagla pusat disat aahe.',
+    },
+    network: {
+        English: 'The line went quiet, I missed what you said.',
+        Hindi: 'Line kat gayi thi, maine suna nahin.',
+        Marathi: 'Line band zali hoti, mala aikale nahi.',
+    },
+    battery: {
+        English: 'My phone is showing low battery.',
+        Hindi: 'Phone ki battery kam dikha raha hai.',
+        Marathi: 'Phone chi battery kami dakhvat aahe.',
+    },
+    bank_closed: {
+        English: 'The branch near Karve Road is closed now.',
+        Hindi: 'Karve Road wali branch abhi band hai.',
+        Marathi: 'Karve Road chi branch aata band aahe.',
+    },
+    son_calling: {
+        English: 'Rahul is calling on the other line.',
+        Hindi: 'Rahul doosri line par call kar raha hai.',
+        Marathi: 'Rahul dusrya line var call karat aahe.',
+    },
+    passbook: {
+        English: 'I cannot find the passbook in the cupboard.',
+        Hindi: 'Passbook almari mein mil hi nahin rahi.',
+        Marathi: 'Passbook kapatat sapadat nahi.',
+    },
+    app_not_opening: {
+        English: 'The app is not opening, the screen went white.',
+        Hindi: 'App khul hi nahin raha, screen safed ho gayi.',
+        Marathi: 'App ughadat nahi, screen pandhra zala.',
+    },
+    repeat: {
+        English: 'I did not follow, please say it again slowly.',
+        Hindi: 'Samajh nahin aaya, phir se dheere batayiye.',
+        Marathi: 'Mala kalale nahi, punha halu sanga.',
+    },
+    neighbour: {
+        English: 'The neighbour has come to the door.',
+        Hindi: 'Padosi darwaze par aaye hain.',
+        Marathi: 'Shejari darat aale aahet.',
+    },
+    tea: {
+        English: 'The milk is boiling over on the stove.',
+        Hindi: 'Gas par doodh ubal raha hai.',
+        Marathi: 'Gas var dudh ubalat aahe.',
+    },
+};
+
+/** Picks a line in the caller's language, falling back to English. */
+const inLanguage = (table, language) => table[language] || table.English;
+
+const fallbackReply = ({ target, pressure, excuse, language = 'English' }) => {
     if (pressure.length > 0) {
         const match = PRESSURE_FALLBACKS[pressure[0].id];
-        if (match) return { text: match, targetAsked: 'none' };
+        // No stalling excuse under pressure: it would sound evasive.
+        if (match) return { text: inLanguage(match, language), targetAsked: 'none', excuseUsed: 'none' };
     }
+
     const key = target ? target.id : 'none';
-    return { text: FALLBACK_REPLIES[key] || FALLBACK_REPLIES.none, targetAsked: key };
+    const ask = inLanguage(FALLBACK_REPLIES[key] || FALLBACK_REPLIES.none, language);
+
+    if (excuse && EXCUSE_CLAUSES[excuse.id]) {
+        return {
+            text: `${inLanguage(EXCUSE_CLAUSES[excuse.id], language)} ${ask}`,
+            targetAsked: key,
+            excuseUsed: excuse.id,
+        };
+    }
+
+    return { text: ask, targetAsked: key, excuseUsed: 'none' };
 };
 
 // ---------------------------------------------------------------------------
@@ -615,13 +746,19 @@ const respond = async ({
     };
 
     const useFallback = (note) => {
-        const { text, targetAsked } = fallbackReply({ target, pressure });
+        const { text, targetAsked, excuseUsed } = fallbackReply({
+            target, pressure, excuse, language: language.language,
+        });
         const reviewed = outputGuard.review(text, { sessionId: session.sessionId, persona });
+        const safe = reviewed.verdict === outputGuard.VERDICTS.BLOCK
+            ? inLanguage(FALLBACK_REPLIES.none, language.language)
+            : reviewed.text;
+
         return {
             ...base,
-            reply: reviewed.verdict === outputGuard.VERDICTS.BLOCK ? FALLBACK_REPLIES.none : reviewed.text,
+            reply: safe,
             targetAsked,
-            excuseUsed: 'none',
+            excuseUsed,
             source: 'fallback',
             note,
             guard: { verdict: reviewed.verdict, violations: reviewed.violations },
@@ -697,13 +834,29 @@ const respond = async ({
         const askedRaw = typeof result.targetAsked === 'string' ? result.targetAsked : 'none';
         const excuseRaw = typeof result.excuseUsed === 'string' ? result.excuseUsed : 'none';
 
+        /**
+         * What is recorded as asked for.
+         *
+         * The model's own claim is used only if it is a real target AND not the
+         * one that was deliberately excluded this turn. Taking the claim at
+         * face value let a model that always reports the same target re-arm the
+         * repeat it was supposed to prevent, so the no-repeat rule would hold
+         * only as long as the model cooperated.
+         */
+        const resolveTarget = () => {
+            const fallbackTo = target ? target.id : 'none';
+            if (!TARGETS.some((t) => t.id === askedRaw)) return fallbackTo;
+            if (session.lastAskedTarget && askedRaw === session.lastAskedTarget) return fallbackTo;
+            return askedRaw;
+        };
+
         return {
             ...base,
             reply: reviewed.text,
             language: typeof result.language === 'string' && result.language.trim() !== ''
                 ? result.language.trim()
                 : language.language,
-            targetAsked: TARGETS.some((t) => t.id === askedRaw) ? askedRaw : (target ? target.id : 'none'),
+            targetAsked: resolveTarget(),
             excuseUsed: EXCUSES.some((e) => e.id === excuseRaw) ? excuseRaw : (excuse ? excuse.id : 'none'),
             ledgerUpdates: recorded.map(({ slot, value }) => ({ slot, value })),
             contradictionsRejected,
@@ -734,7 +887,6 @@ module.exports = {
     detectPressure,
     detectInjection,
     shouldEnd,
-    shouldStandDown,
     typingDelayMs,
     buildSystemPrompt,
     wrapIncoming,
@@ -746,4 +898,7 @@ module.exports = {
     LIMITS,
     TYPING_DELAY,
     FALLBACK_REPLIES,
+    PRESSURE_FALLBACKS,
+    EXCUSE_CLAUSES,
+    fallbackReply,
 };

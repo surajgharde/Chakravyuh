@@ -41,10 +41,13 @@ const stubLlm = () => new LlmClient(
             if (system.includes('stages of the scam script')) {
                 return JSON.stringify({ stages: [] });
             }
+            // The decoy's own output schema.
             return JSON.stringify({
                 reply: 'Haan beta, which number should I type?',
-                askedFor: 'bankAccounts',
-                observed: 'Demanded an OTP.',
+                language: 'English',
+                targetAsked: 'bankAccount',
+                excuseUsed: 'none',
+                ledgerUpdates: [],
             });
         },
     }
@@ -58,11 +61,14 @@ const post = (path, body, headers = { 'x-api-key': API_KEY }) => fetch(`${baseUr
 
 const get = (path, headers = { 'x-api-key': API_KEY }) => fetch(`${baseUrl}${path}`, { headers });
 
+const decoyTargetIds = () => require('../src/agents/decoy').TARGETS.map((t) => t.id);
+
 test.before(async () => {
     mongoServer = await MongoMemoryServer.create();
     await mongoose.connect(mongoServer.getUri());
 
-    const config = build({ API_SECRET_KEY: API_KEY, MONGO_URI: mongoServer.getUri(), PORT: '0' });
+    // DEMO_MODE keeps the decoy's typing delay out of the test run.
+    const config = build({ API_SECRET_KEY: API_KEY, MONGO_URI: mongoServer.getUri(), PORT: '0', DEMO_MODE: '1' });
     const app = createApp(config, { llm: stubLlm() });
 
     await new Promise((resolve) => {
@@ -230,19 +236,56 @@ test('a session with no timestamps still reports a real duration', async () => {
 });
 
 test('the decoy switches target instead of repeating an unanswered question', async () => {
+    const decoy = require('../src/agents/decoy');
     const sessionId = 'pivot-1';
+
     await post('/api/message', { sessionId, message: { text: 'Share the OTP immediately, account will be blocked today.' } });
 
     const first = await Session.findOne({ sessionId });
-    assert.equal(first.lastAskedTarget, 'bankAccounts');
+    assert.ok(
+        decoy.TARGETS.some((t) => t.id === first.lastAskedTarget),
+        `asked for an unknown target: ${first.lastAskedTarget}`
+    );
 
     await post('/api/message', { sessionId, message: { text: 'I cannot give that. Just pay the fee.' } });
     const second = await Session.findOne({ sessionId });
-    assert.equal(second.lastAskedTarget, 'bankAccounts', 'the stub always reports bankAccounts');
 
-    // The target chosen for the next turn must differ, since the first ask went unanswered.
-    const decoy = require('../src/agents/decoy');
-    assert.notEqual(decoy.chooseTarget(second).id, 'bankAccounts');
+    // Nothing was handed over, so the target asked must have moved on.
+    assert.notEqual(
+        second.lastAskedTarget,
+        first.lastAskedTarget,
+        'the same question was asked twice in a row'
+    );
+});
+
+test('the decoy records what it asked for, the excuse it used and the language', async () => {
+    const sessionId = 'decoy-fields-1';
+    const body = await (await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP immediately, account will be blocked today.', timestamp: Date.now() },
+    })).json();
+
+    assert.equal(body.state, 'DECOY_ACTIVE');
+    assert.ok(body.decoy, 'the decoy block is present once engaged');
+    assert.ok(['English', 'Hindi', 'Marathi'].includes(body.decoy.language));
+    assert.ok(decoyTargetIds().includes(body.decoy.targetAsked) || body.decoy.targetAsked === 'none');
+    assert.ok(Array.isArray(body.decoy.ledgerUpdates));
+    assert.equal(body.decoy.guard.verdict, 'pass');
+    assert.equal(body.measured.simulatedTypingDelayMs, 0, 'the test config runs in demo mode');
+});
+
+test('the persona ledger is seeded and persisted on the session', async () => {
+    const sessionId = 'ledger-1';
+    await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP immediately, account will be blocked today.', timestamp: Date.now() },
+    });
+
+    const session = await Session.findOne({ sessionId });
+    const slots = session.personaLedger.map((e) => e.slot);
+    for (const slot of ['son_name', 'son_city', 'husband_status', 'bank_reference']) {
+        assert.ok(slots.includes(slot), `the ledger is missing ${slot}`);
+    }
 });
 
 test('the session listing returns measured values only', async () => {
