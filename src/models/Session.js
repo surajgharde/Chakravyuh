@@ -202,6 +202,11 @@ const SessionSchema = new mongoose.Schema({
         reviewedBy: { type: String, default: null }, // an alias or relationship, never a real name
     },
 
+    // Set on synthetic sessions created by scripts/seed-demo.js, so a seeded
+    // demo session is never mistaken for a real incident.
+    seeded: { type: Boolean, default: false },
+    seedNote: { type: String, default: null },
+
     // Alias used in every report. The protected user's real name and number
     // never appear in an exported document.
     userAlias: { type: String, default: null },

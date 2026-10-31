@@ -15,6 +15,7 @@ const Session = require('../models/Session');
 const guardian = require('../agents/guardian');
 const decoy = require('../agents/decoy');
 const extractor = require('./extractor');
+const intelligence = require('../agents/intelligence');
 const stages = require('./stages');
 const logger = require('./logger');
 const trustedContacts = require('./trustedContacts');
@@ -233,8 +234,11 @@ const handleTurn = async (body, deps = {}) => {
         session.markModified('excuseHistory');
     }
 
-    if (!session.agentNotes && verdict?.classifier.reasons.length > 0) {
-        session.agentNotes = verdict.classifier.reasons.join('; ');
+    // agentNotes is rebuilt from the stored session every turn rather than
+    // appended to. It is assembled from extracted data only - no model call -
+    // so it can never state a fact the session does not contain.
+    if (isIncomingFromCounterpart) {
+        session.agentNotes = intelligence.buildAgentNotes(session);
     }
 
     session.markModified('messages');

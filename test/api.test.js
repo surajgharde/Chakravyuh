@@ -601,3 +601,183 @@ test('trusted contacts are scoped to one protected user', async () => {
     const forB = await (await get('/api/trusted-contacts?userId=user-b')).json();
     assert.equal(forB.count, 0, 'contacts belong to one protected user only');
 });
+
+
+// ---------------------------------------------------------------------------
+// Evidence report and network view, end to end
+// ---------------------------------------------------------------------------
+
+/** Runs a short scam conversation and returns the session id. */
+const runScamSession = async (sessionId, lines, metadata = {}) => {
+    for (const text of lines) {
+        await post('/api/message', {
+            sessionId,
+            message: { sender: 'scammer', text, timestamp: Date.now() },
+            metadata: { channel: 'Call', language: 'English', locale: 'IN', ...metadata },
+        });
+    }
+    return sessionId;
+};
+
+test('the report JSON matches what is stored on the session', async () => {
+    const sessionId = 'report-api-1';
+    await runScamSession(sessionId, [
+        'Madam this is CBI Pune. A parcel in your name was seized with narcotics. Do not tell anyone.',
+        'Transfer Rs 2,50,000 to account 50100234567890, IFSC SBIN0001234, or you will be arrested today.',
+        'Or send it to cyber.verify@okaxis. My number is 9876543210.',
+    ]);
+
+    const { report } = await (await get(`/api/sessions/${sessionId}/report`)).json();
+    const session = await Session.findOne({ sessionId });
+
+    assert.equal(report.session.sessionId, sessionId);
+    assert.equal(report.session.messageCounts.total, session.messageCount);
+    assert.equal(report.session.messageCounts.fromCaller, session.scammerMessageCount);
+    assert.equal(report.session.messageCounts.fromDecoy, session.decoyMessageCount);
+    assert.equal(report.session.durationSeconds, session.engagementDurationSeconds());
+    assert.equal(report.transcript.length, session.messages.length);
+    assert.equal(report.guardianDecisionLog.length, session.guardianLog.length);
+
+    // Identifiers come back with the sentence they were found in.
+    const upi = report.suspectIdentifiers.find((row) => row.value === 'cyber.verify@okaxis');
+    assert.ok(upi);
+    assert.ok(upi.excerpt.includes('cyber.verify@okaxis'));
+    assert.equal(report.moneyDemanded.highestRupees, 250000);
+});
+
+test('the report never contains the protected user id', async () => {
+    const sessionId = 'report-api-privacy';
+    await runScamSession(
+        sessionId,
+        ['Share the OTP now or your account is blocked today.'],
+        { userId: 'elderly-9988776655', from: '+919812345678' }
+    );
+
+    const body = await (await get(`/api/sessions/${sessionId}/report`)).text();
+    assert.ok(!body.includes('elderly-9988776655'), 'the user id leaked into the report');
+    assert.ok(JSON.parse(body).report.protectedUser.alias.startsWith('Protected User '));
+});
+
+test('the printable HTML report is served and is self-contained', async () => {
+    const sessionId = 'report-api-html';
+    await runScamSession(sessionId, [
+        'Share the OTP now or your account is blocked today.',
+        'Transfer 50000 to cyber.verify@okaxis immediately.',
+    ]);
+
+    const response = await get(`/api/sessions/${sessionId}/report.html`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type'), /text\/html/);
+
+    const html = await response.text();
+    assert.ok(html.startsWith('<!DOCTYPE html>'));
+    assert.ok(html.includes('cyber.verify@okaxis'));
+    assert.ok(html.includes('NOT READY TO FILE'), 'unreviewed reports are stamped as drafts');
+    assert.ok(!/<script/i.test(html));
+});
+
+test('the PDF report is served as a real PDF download', async () => {
+    const sessionId = 'report-api-pdf';
+    await runScamSession(sessionId, ['Share the OTP now or your account is blocked today.']);
+
+    const response = await get(`/api/sessions/${sessionId}/report.pdf`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'application/pdf');
+    assert.match(response.headers.get('content-disposition'), /attachment; filename="CHKV-.*DRAFT\.pdf"/);
+
+    const bytes = Buffer.from(await response.arrayBuffer());
+    assert.equal(bytes.subarray(0, 5).toString(), '%PDF-');
+});
+
+test('an unreviewed report cannot be exported as ready to file', async () => {
+    const sessionId = 'report-api-gate';
+    await runScamSession(sessionId, ['Share the OTP now or your account is blocked today.']);
+
+    const refused = await get(`/api/sessions/${sessionId}/report.pdf?ready=1`);
+    assert.equal(refused.status, 409);
+
+    const body = await refused.json();
+    assert.equal(body.readyToFile, false);
+    assert.match(body.error, /not been reviewed/i);
+});
+
+test('ticking the review box unlocks the ready-to-file export', async () => {
+    const sessionId = 'report-api-review';
+    await runScamSession(sessionId, ['Share the OTP now or your account is blocked today.']);
+
+    const bad = await post(`/api/sessions/${sessionId}/report/review`, {});
+    assert.equal(bad.status, 400, 'the box has to actually be ticked');
+
+    const review = await post(`/api/sessions/${sessionId}/report/review`, {
+        reviewedByFamily: true,
+        reviewedBy: 'son',
+    });
+    assert.equal(review.status, 200);
+    assert.equal((await review.json()).review.readyToFile, true);
+
+    const exported = await get(`/api/sessions/${sessionId}/report.pdf?ready=1`);
+    assert.equal(exported.status, 200);
+    assert.match(exported.headers.get('content-disposition'), /filename="CHKV-[^"]*\.pdf"/);
+    assert.ok(!exported.headers.get('content-disposition').includes('DRAFT'));
+
+    const html = await (await get(`/api/sessions/${sessionId}/report.html`)).text();
+    assert.ok(html.includes('READY TO FILE'));
+    assert.ok(html.includes('son'));
+});
+
+test('a report for a session that does not exist is a 404', async () => {
+    for (const path of ['/report', '/report.html', '/report.pdf']) {
+        const response = await get(`/api/sessions/no-such-session${path}`);
+        assert.equal(response.status, 404, path);
+    }
+});
+
+test('agentNotes on the session is the summary built from its own data', async () => {
+    const sessionId = 'report-api-notes';
+    await runScamSession(sessionId, [
+        'Madam this is CBI. Transfer Rs 2,50,000 to cyber.verify@okaxis today or be arrested.',
+    ]);
+
+    const session = await Session.findOne({ sessionId });
+    assert.ok(session.agentNotes.length > 0);
+    assert.ok(session.agentNotes.includes('Rs 2,50,000'));
+
+    // And it states nothing the session does not hold.
+    const amounts = session.entities.filter((e) => e.type === 'amount').map((e) => Number(e.normalized));
+    for (const match of session.agentNotes.matchAll(/Rs ([\d,]+)/g)) {
+        assert.ok(amounts.includes(Number(match[1].replace(/,/g, ''))));
+    }
+});
+
+test('the network view links two sessions that share a UPI id', async () => {
+    const shared = 'network.mule@okaxis';
+
+    await runScamSession('net-api-1', [
+        `Transfer Rs 50,000 to ${shared} today or you will be arrested.`,
+    ], { userId: 'net-user' });
+
+    await runScamSession('net-api-2', [
+        `Pay the clearance fee to ${shared} immediately, do not tell anyone.`,
+    ], { userId: 'net-user' });
+
+    const graph = await (await get('/api/network?userId=net-user')).json();
+
+    assert.equal(graph.status, 'success');
+    assert.equal(graph.stats.sessions, 2);
+
+    const node = graph.nodes.find((n) => n.value === shared);
+    assert.ok(node, 'the shared identifier is a node');
+    assert.equal(node.shared, true);
+    assert.equal(node.sessionCount, 2);
+
+    assert.equal(graph.clusters.length, 1);
+    assert.deepEqual([...graph.clusters[0].sessions].sort(), ['net-api-1', 'net-api-2']);
+    assert.equal(graph.clusters[0].linkedBy[0].value, shared);
+});
+
+test('the network view is empty rather than broken when nothing matches', async () => {
+    const graph = await (await get('/api/network?userId=nobody-at-all')).json();
+    assert.equal(graph.status, 'success');
+    assert.deepEqual(graph.nodes, []);
+    assert.deepEqual(graph.clusters, []);
+});
