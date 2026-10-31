@@ -137,7 +137,8 @@ test('identifiers the scammer sends are extracted into the session', async () =>
     const body = await response.json();
     assert.ok(body.intelligence.bankAccounts.includes('50100234567890'));
     assert.ok(body.intelligence.upiIds.includes('refund@okaxis'));
-    assert.ok(body.measured.newIdentifiersThisTurn >= 2);
+    assert.ok(body.measured.newEntitiesThisTurn >= 2);
+    assert.ok(body.measured.newEntityTypesThisTurn.includes('bankAccount'));
 });
 
 test('counts are measured, and the simulated delay is reported as zero and separate', async () => {
@@ -233,4 +234,132 @@ test('the session listing returns measured values only', async () => {
 
 test('an unknown session is a 404', async () => {
     assert.equal((await get('/api/sessions/does-not-exist')).status, 404);
+});
+
+// ---------------------------------------------------------------------------
+// Entities and script stages, end to end
+// ---------------------------------------------------------------------------
+
+test('extracted entities reach the API with full provenance', async () => {
+    const sessionId = 'entities-1';
+    await post('/api/message', {
+        sessionId,
+        message: {
+            sender: 'scammer',
+            text: 'This is CBI. Transfer Rs 2,50,000 to a/c 50100234567890, IFSC SBIN0001234. Do not tell anyone.',
+            timestamp: Date.now(),
+        },
+        metadata: { channel: 'Call', language: 'English', locale: 'IN' },
+    });
+
+    const { session } = await (await get(`/api/sessions/${sessionId}`)).json();
+
+    const account = session.entities.find((e) => e.type === 'bankAccount');
+    assert.ok(account, 'the account number was extracted');
+    assert.equal(account.normalized, '50100234567890');
+    assert.equal(account.sessionId, sessionId);
+    assert.equal(account.messageId, 'm1', 'points back at the message it came from');
+    assert.ok(account.timestamp, 'carries a timestamp');
+    assert.ok(
+        account.sentence.includes('50100234567890'),
+        'quotes the sentence verbatim, so the report can be audited'
+    );
+
+    const types = session.entities.map((e) => e.type);
+    for (const expected of ['bankAccount', 'ifsc', 'amount', 'impersonatedAuthority']) {
+        assert.ok(types.includes(expected), expected);
+    }
+
+    const amount = session.entities.find((e) => e.type === 'amount');
+    assert.equal(amount.normalized, 250000, 'rupees as an integer');
+});
+
+test('script stages are tagged per message and rolled up per session', async () => {
+    const sessionId = 'stages-1';
+    const first = await post('/api/message', {
+        sessionId,
+        message: {
+            sender: 'scammer',
+            text: 'Madam this is Inspector Shinde from cyber crime. A parcel in your name had MDMA.',
+            timestamp: Date.now(),
+        },
+    });
+
+    const firstBody = await first.json();
+    const firstStages = firstBody.scriptStages.thisMessage.map((t) => t.stage);
+    assert.ok(firstStages.includes('AUTHORITY_CLAIM'));
+    assert.ok(firstStages.includes('ACCUSATION'));
+
+    await post('/api/message', {
+        sessionId,
+        message: {
+            sender: 'scammer',
+            text: 'Transfer 2 lakh to the RBI safe account immediately, it is fully refundable.',
+            timestamp: Date.now(),
+        },
+    });
+
+    const { session } = await (await get(`/api/sessions/${sessionId}`)).json();
+
+    // The session accumulates the whole script, in taxonomy order.
+    for (const expected of ['AUTHORITY_CLAIM', 'ACCUSATION', 'URGENCY', 'PAYMENT_DEMAND', 'VERIFICATION_LURE']) {
+        assert.ok(session.scriptStages.includes(expected), expected);
+    }
+
+    const scammerMessages = session.messages.filter((m) => m.role === 'scammer');
+    assert.ok(scammerMessages.every((m) => Array.isArray(m.stages)));
+    assert.ok(scammerMessages[0].stages.every((t) => ['rules', 'llm'].includes(t.method)));
+});
+
+test('each stage tag records which method produced it', async () => {
+    const sessionId = 'stages-2';
+    const response = await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP immediately or your account will be blocked.', timestamp: Date.now() },
+    });
+
+    const body = await response.json();
+    const credential = body.scriptStages.thisMessage.find((t) => t.stage === 'CREDENTIAL_REQUEST');
+    assert.equal(credential.method, 'rules');
+    assert.ok(credential.evidence.length > 0, 'a rule tag quotes what it matched');
+});
+
+test('the decoy side is never mined for entities', async () => {
+    const sessionId = 'decoy-not-mined';
+    await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP now, account will be blocked today.', timestamp: Date.now() },
+    });
+
+    const session = await Session.findOne({ sessionId });
+    const decoyMessages = session.messages.filter((m) => m.role === 'decoy');
+    assert.ok(decoyMessages.length > 0);
+    for (const entity of session.entities) {
+        assert.ok(
+            !decoyMessages.some((m) => m.messageId === entity.messageId),
+            'evidence comes from the scammer, never from our own replies'
+        );
+    }
+});
+
+test('a Marathi scam message is handled end to end', async () => {
+    const sessionId = 'marathi-1';
+    const response = await post('/api/message', {
+        sessionId,
+        message: {
+            sender: 'scammer',
+            text: 'मी सायबर विभागातून बोलत आहे. दंडाची रक्कम पाच लाख खात्यात 50100234567890 जमा करा. कोणालाही सांगू नका.',
+            timestamp: Date.now(),
+        },
+        metadata: { channel: 'Call', language: 'Marathi', locale: 'IN' },
+    });
+
+    const body = await response.json();
+    assert.ok(body.intelligence.bankAccounts.includes('50100234567890'));
+    assert.ok(body.intelligence.amountsDemanded.includes(500000));
+    assert.ok(body.intelligence.impersonatedAuthorities.includes('cyber cell'));
+
+    const tagged = body.scriptStages.thisMessage.map((t) => t.stage);
+    assert.ok(tagged.includes('PAYMENT_DEMAND'));
+    assert.ok(tagged.includes('ISOLATION'));
 });

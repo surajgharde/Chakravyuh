@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const guardian = require('../src/agents/guardian');
-const intelligence = require('../src/services/intelligence');
+const extractor = require('../src/services/extractor');
 const { LlmClient } = require('../src/llm/client');
 
 const llmSaying = (verdict) => new LlmClient(
@@ -10,9 +10,13 @@ const llmSaying = (verdict) => new LlmClient(
     { transport: async () => JSON.stringify(verdict) }
 );
 
+const summaryFor = (text) => extractor.summarize(
+    extractor.extractEntities(text, { sessionId: 's', messageId: 'm1', timestamp: null })
+);
+
 const assessText = (text, options = {}) => guardian.assess({
     incomingText: text,
-    extracted: intelligence.extract(text),
+    summary: summaryFor(text),
     ...options,
 });
 
@@ -121,7 +125,7 @@ test('signals accumulate across turns, not just the newest message', async () =>
             { role: 'scammer', text: 'This is calling from the income tax department.' },
             { role: 'scammer', text: 'Do not tell anyone about this, stay on the call.' },
         ],
-        extracted: intelligence.extract('Now transfer 25000 to UPI id refund@okaxis.'),
+        summary: summaryFor('Now transfer 25000 to UPI id refund@okaxis.'),
     });
 
     assert.ok(result.signalIds.includes('authority_claim'));
@@ -138,5 +142,73 @@ test('every reported signal carries a human-readable reason', async () => {
         assert.equal(typeof signal.description, 'string');
         assert.ok(signal.description.length > 0);
         assert.equal(typeof signal.weight, 'number');
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Language-agnostic detection via script stages
+// ---------------------------------------------------------------------------
+
+const stageTagger = require('../src/services/stages');
+
+/** Assesses a message the way the pipeline does, stage tags included. */
+const assessWithStages = (text, options = {}) => guardian.assess({
+    incomingText: text,
+    summary: summaryFor(text),
+    scriptStages: stageTagger.tagWithRules(text).map((t) => t.stage),
+    ...options,
+});
+
+test('a Marathi scam scores like the same scam in English', async () => {
+    // The English signal table alone reached 0.50 on this and stalled at WATCH.
+    const marathi = 'Madam, mi Pune cyber cell madhun bolat aahe. Tumchya nawavar FIR number '
+        + 'MUM/CYB/2026/00891 aahe. Lagech paach lakh khatyat 50100234567890 jama kara. Konala sangu naka.';
+
+    const result = await assessWithStages(marathi);
+    assert.equal(result.stage, guardian.STAGES.ENGAGE);
+    assert.ok(result.hasHardSignal);
+    assert.ok(result.signalIds.some((id) => id.startsWith('stage_')), 'stage tags carried the detection');
+});
+
+test('a Hindi OTP demand in Devanagari hands off', async () => {
+    const hindi = 'मैं एचडीएफसी बैंक से बोल रहा हूं। आपका खाता बंद हो जाएगा। तुरंत ओटीपी बताओ।';
+    const result = await assessWithStages(hindi);
+    assert.equal(result.stage, guardian.STAGES.ENGAGE);
+    assert.ok(result.signalIds.includes('stage_credential_request'));
+});
+
+test('a stage signal does not double-count a text signal', async () => {
+    // In English both layers see the same OTP demand; only one may score.
+    const english = 'Share the OTP immediately or your account will be blocked today.';
+    const result = await assessWithStages(english);
+
+    assert.ok(result.signalIds.includes('otp_or_pin_request'));
+    assert.ok(
+        !result.signalIds.includes('stage_credential_request'),
+        'the text signal already covered it'
+    );
+});
+
+test('stage signals cannot promote a legitimate caller', async () => {
+    const legitimate = [
+        'Sir, your Amazon parcel is at the gate, please come down.',
+        'नमस्कार, तुमची अपॉइंटमेंट उद्या सकाळी दहा वाजता आहे.',
+        'Your prescription is ready for pickup at the pharmacy till 8 pm.',
+    ];
+
+    for (const text of legitimate) {
+        const result = await assessWithStages(text);
+        assert.notEqual(result.stage, guardian.STAGES.ENGAGE, text);
+        assert.equal(result.hasHardSignal, false, text);
+    }
+});
+
+test('every stage signal names the text signals it stands in for', () => {
+    const textSignalIds = new Set(guardian.SIGNALS.map((s) => s.id));
+    for (const signal of guardian.STAGE_SIGNALS) {
+        assert.ok(Array.isArray(signal.unless) && signal.unless.length > 0, signal.id);
+        for (const id of signal.unless) {
+            assert.ok(textSignalIds.has(id), `${signal.id} refers to unknown signal ${id}`);
+        }
     }
 });

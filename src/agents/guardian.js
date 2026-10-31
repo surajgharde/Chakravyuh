@@ -132,6 +132,80 @@ const EXCULPATORY = [
     },
 ];
 
+/**
+ * Signals derived from script stage tags rather than from the English text
+ * patterns above.
+ *
+ * The signal table is written in English, so a scam run in Hindi or Marathi
+ * scored far too low: a romanised Marathi digital-arrest script with a mule
+ * account in it reached only 0.50 and stalled at WATCH. The stage tagger
+ * (services/stages.js) has vocabularies for all three languages, so reusing
+ * its output makes detection language-agnostic.
+ *
+ * `unless` names the text signals that cover the same ground. A stage signal
+ * only contributes when none of them fired, so an English message is never
+ * counted twice for the same behaviour.
+ */
+const STAGE_SIGNALS = [
+    {
+        id: 'stage_credential_request',
+        hard: true,
+        weight: 0.40,
+        description: 'Script stage: asks for a credential or remote access',
+        requires: ['CREDENTIAL_REQUEST'],
+        unless: ['otp_or_pin_request', 'remote_access_request'],
+    },
+    {
+        id: 'stage_payment_under_pressure',
+        hard: true,
+        weight: 0.35,
+        description: 'Script stage: demands payment alongside a threat or an accusation',
+        requires: ['PAYMENT_DEMAND'],
+        requiresAny: ['THREAT', 'ACCUSATION', 'ISOLATION'],
+        unless: ['payment_redirect'],
+    },
+    {
+        id: 'stage_accusation_and_threat',
+        hard: true,
+        weight: 0.40,
+        description: 'Script stage: accuses the target of a crime and threatens consequences',
+        requires: ['ACCUSATION', 'THREAT'],
+        unless: ['arrest_or_legal_threat'],
+    },
+    {
+        id: 'stage_isolation',
+        hard: false,
+        weight: 0.20,
+        description: 'Script stage: isolates the target from family or keeps them on the line',
+        requires: ['ISOLATION'],
+        unless: ['secrecy_instruction'],
+    },
+    {
+        id: 'stage_authority_claim',
+        hard: false,
+        weight: 0.15,
+        description: 'Script stage: claims to represent an institution',
+        requires: ['AUTHORITY_CLAIM'],
+        unless: ['authority_claim'],
+    },
+    {
+        id: 'stage_urgency',
+        hard: false,
+        weight: 0.15,
+        description: 'Script stage: imposes a deadline',
+        requires: ['URGENCY'],
+        unless: ['urgency_pressure'],
+    },
+    {
+        id: 'stage_verification_lure',
+        hard: false,
+        weight: 0.20,
+        description: 'Script stage: frames the payment as safe or refundable',
+        requires: ['VERIFICATION_LURE'],
+        unless: ['fee_before_benefit'],
+    },
+];
+
 const WEIGHTS = {
     // The LLM can move the score, but never decide alone.
     llmScam: 0.20,
@@ -278,6 +352,23 @@ const assess = async ({
     const { score: ruleScore, fired } = scoreSignals(corpus);
     let score = ruleScore;
 
+    // Stage-derived signals, so a scam in Hindi or Marathi scores like the
+    // same scam in English.
+    const firedIds = new Set(fired.map((s) => s.id));
+    for (const signal of STAGE_SIGNALS) {
+        if (signal.unless.some((id) => firedIds.has(id))) continue;
+        if (!signal.requires.every((stage) => scriptStages.includes(stage))) continue;
+        if (signal.requiresAny && !signal.requiresAny.some((stage) => scriptStages.includes(stage))) continue;
+
+        fired.push({
+            id: signal.id,
+            hard: signal.hard,
+            weight: signal.weight,
+            description: signal.description,
+        });
+        score += signal.weight;
+    }
+
     // An identifier the sender volunteered is corroboration, not a tactic on its own.
     const volunteered = Boolean(summary
         && PAYMENT_ROUTE_FIELDS.some((field) => (summary[field] || []).length > 0));
@@ -346,6 +437,7 @@ module.exports = {
     classifyScamType,
     STAGES,
     SIGNALS,
+    STAGE_SIGNALS,
     EXCULPATORY,
     THRESHOLDS,
     WEIGHTS,

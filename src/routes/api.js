@@ -35,12 +35,18 @@ const toSessionView = (session) => ({
         lastSeenAt: session.lastSeenAt,
     },
     intelligence: session.intelligence,
+    // The evidence itself: one record per identifier, each carrying the message
+    // and the sentence it came from.
+    entities: session.entities,
+    scriptStages: session.scriptStages,
     agentNotes: session.agentNotes,
     messages: session.messages.map((m) => ({
+        messageId: m.messageId,
         role: m.role,
         text: m.text,
         ts: m.ts,
         receivedAt: m.receivedAt,
+        stages: m.stages,
     })),
 });
 
@@ -72,6 +78,8 @@ const createRouter = (deps) => {
                 confidence: s.confidence,
                 scamType: s.scamType,
                 messageCount: s.messageCount,
+                entityCount: s.entities.length,
+                scriptStages: s.scriptStages,
                 engagementDurationSeconds: s.engagementDurationSeconds(),
                 lastSeenAt: s.lastSeenAt,
             })),
