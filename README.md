@@ -17,13 +17,15 @@ persona, scoring and reporting have been rebuilt — see
 
 ## Status
 
-Phases 1 and 2 are complete: the repo is cleaned up, the scoring hacks are gone,
-the three agents are wired end to end behind a working API, and extraction now
-produces auditable evidence in English, Hindi and Marathi.
+Phases 1 to 3 are complete: the repo is cleaned up, the scoring hacks are gone,
+the three agents are wired end to end behind a working API, extraction produces
+auditable evidence in English, Hindi and Marathi, and the Guardian owns the
+session state with a measured zero false-positive rate on its test corpus.
 
 | Part | State |
 |---|---|
-| Guardian — detection and hand-off | working; two-layer, language-agnostic, with a legitimate-caller veto |
+| Guardian — scoring, state machine, hand-off | working; 10 weighted signals, 6 states, Socket.IO events |
+| False-positive protection — trusted contacts, "This is genuine" | working |
 | Decoy — elderly persona, target tracking | working, with guardrails and hard limits |
 | Entity extraction — 13 types, full provenance | working; the original's false positives are fixed and under test |
 | Script stage tagging — 9 stages, rules then LLM | working |
@@ -62,7 +64,7 @@ Both paths log that they are degraded, and the API reports
 model response.
 
 ```bash
-npm test     # 189 tests, no network and no LLM key needed
+npm test     # 235 tests, no network and no LLM key needed
 npm run dev  # restart on change
 ```
 
@@ -81,60 +83,203 @@ npm run dev  # restart on change
             keyword rules, then one LLM call
                        |
                  [  GUARDIAN  ]
-          text signals + stage signals + LLM verdict
+        10 weighted rule signals + bounded LLM label
+              owns the session state machine
                        |
-         +-------------+-------------+
-         |             |             |
-       PASS          WATCH        ENGAGE
-     no reply      no reply      hand off
-                                     |
-                               [  DECOY  ]
-                            persona reply, one
-                            missing detail at a time
+     +--------------+--+-----------+-------------+
+     |              |              |             |
+ MONITORING    SUSPICIOUS    DECOY_ACTIVE      LEGIT
+  no reply       warn the      hand off      released,
+                 user, no                    never baited
+                 reply              |
+                              [  DECOY  ]
+                           persona reply, one
+                           missing detail at a time
 ```
 
 ### Guardian
 
-Detection has two layers.
+The Guardian receives every incoming message for a protected user, scores it,
+and owns the session state. It is the only thing that can let the decoy speak.
 
-A **deterministic signal table** runs first. Each rule that fires adds a fixed,
-documented weight — `src/agents/guardian.js` is the whole specification. Eleven
-rules currently look for things like an OTP request, a payment redirect, an
-arrest threat, a secrecy instruction, or an artificial deadline. Two
-*exculpatory* rules subtract weight: a caller who states they will never ask for
-an OTP, or who invites you to call the number on your own card, is behaving the
-way a real bank does.
+**The state machine**
 
-A second deterministic layer scores **script stage signals**. The text patterns
-above are written in English, so a scam run in Marathi scored far too low — a
-romanised digital-arrest script with a mule account in it reached only 0.50 and
-stalled at `WATCH`. The stage tagger has vocabularies for all three languages, so
-the Guardian reuses its output: a payment demand alongside a threat is a hard
-signal whatever language it arrives in. Each stage signal names the text signals
-it stands in for and contributes nothing when one of those already fired, so an
-English message is never counted twice for the same behaviour.
+```
+  MONITORING ──> SUSPICIOUS ──> DECOY_ACTIVE ──> ENDED
+       │              │               │
+       └──> LEGIT <───┘               └──> FALSE_POSITIVE
+```
 
-An optional **LLM verdict** on intent runs last and can only nudge the result:
-`+0.20` for a scam reading, `-0.30` for a legitimate one.
-
-`confidence` is the sum of those weights, clamped to 0–1. Nothing about it is
-invented by the model, and it does not start from a floor.
-
-Three outcomes, so a real caller is never baited:
-
-| Outcome | Meaning | Decoy |
+| State | Meaning | Decoy replies? |
 |---|---|---|
-| `PASS` | nothing to act on | no |
-| `WATCH` | suspicious but unproven | no |
-| `ENGAGE` | confirmed; hand off | yes |
+| `MONITORING` | watching; nothing to act on | no |
+| `SUSPICIOUS` | worth warning the user about | **no** |
+| `DECOY_ACTIVE` | the decoy has the conversation | yes |
+| `ENDED` | engagement finished on its own terms | no |
+| `LEGIT` | released as a real caller | no |
+| `FALSE_POSITIVE` | the user pressed "This is genuine" | no |
 
-`ENGAGE` needs **both** a confidence of 0.60 or more **and** at least one *hard*
-signal. That second condition is the point: urgency, an authority claim and an
-account warning together clear the score threshold, but a worried real caller
-from an electricity board produces all three, so soft signals alone can never
-trigger a hand-off. And an explicit "legitimate" verdict from the classifier
-vetoes hand-off outright — the response records
-`handoff_blocked_by_classifier` when that happens.
+**Scoring**
+
+Ten rule signals, each with a fixed weight, summed and capped at 100:
+
+| Signal | Weight | Hard |
+|---|---|---|
+| `credential_request` — asks for an OTP, PIN, CVV or password | 35 | yes |
+| `remote_access_app` — asks to install an app or share a screen | 35 | yes |
+| `payment_demand` — pushes money to an account, UPI id, QR or wallet | 30 | yes |
+| `threat` — arrest, legal action, a criminal accusation, or an immediate cut-off | 25 | no |
+| `isolation` — tells the user to keep it secret or stay on the line | 20 | **yes** |
+| `prize_or_fee_lure` — dangles a prize, or asks a fee before a benefit | 20 | no |
+| `authority_claim` — claims to be a bank, government body, courier or telecom | 15 | no |
+| `urgency` — an artificial deadline | 10 | no |
+| `link` — a link, short link or obfuscated one | 10 | no |
+| `unknown_number` — the sender is not a known contact | 5 | no |
+
+Four *exculpatory* rules subtract, because they are what separates a real
+institution from someone imitating one: telling the user **not** to share an OTP
+(−20), pointing at an official callback channel (−15), a `gov.in` or known
+utility domain (−15), and stating that no action is needed (−10).
+
+`isolation` is marked hard deliberately. A real bank, clinic or courier never
+tells someone to keep a call secret from their family or not to hang up.
+
+The tenth signal, `prize_or_fee_lure`, goes beyond the nine this agent was
+specified with. The nine are all built around pressure, so an advance-fee scam —
+lottery, job offer, investment — topped out around 40 and could only ever be
+warned about, never engaged. Those are among the most common scams run in India.
+
+**Confidence**
+
+There is no invented probability anywhere. What is shown is the score, the
+breakdown of exactly which rules produced it, and the classifier's label, side
+by side:
+
+```json
+"guardian": {
+  "state": "DECOY_ACTIVE",
+  "score": 85,
+  "rawScore": 85,
+  "breakdown": [
+    { "id": "credential_request", "label": "Credential request", "weight": 35, "hard": true,
+      "description": "Asks for an OTP, PIN, CVV, password or card number" },
+    { "id": "threat", "label": "Threat", "weight": 25, "hard": false,
+      "description": "Threatens arrest, legal action, or an immediate cut-off" },
+    { "id": "authority_claim", "label": "Authority claim", "weight": 15, "hard": false,
+      "description": "Claims to be a bank, government body, courier or telecom" },
+    { "id": "urgency", "label": "Urgency", "weight": 10, "hard": false,
+      "description": "Imposes an artificial deadline" }
+  ],
+  "classifier": { "label": "scam", "reasons": ["demands an OTP", "threatens to block the account"] },
+  "thresholds": { "decoy": 60, "suspicious": 30, "release": 30 },
+  "decisionMs": 2
+}
+```
+
+**Thresholds** (configurable via `GUARDIAN_*` in `.env`): 60 or above is
+`DECOY_ACTIVE`, 30–59 is `SUSPICIOUS`, below 30 is `MONITORING`.
+
+Scoring runs over the whole conversation, not just the newest line. A script
+that arrives spread across turns — "this is CBI" first, "transfer to this
+account" second — still adds up.
+
+**The classifier's limits**
+
+A short LLM call returns `{label: scam | suspicious | legit, reasons[]}`. It is
+deliberately boxed in:
+
+- it can raise the state by **one** rung at most;
+- it can never reach `DECOY_ACTIVE` unless at least **two** rule signals have
+  fired and one of them is **hard**;
+- a `legit` label caps the state at `SUSPICIOUS`, whatever the score;
+- it gets a 1.1 second budget and is abandoned if it exceeds it.
+
+**False-positive protection**
+
+This is the part the system is built around. Five independent guards:
+
+1. **Trusted contacts.** Family, a doctor, a bank's real helpline. Their
+   messages never reach the decoy, whatever the score. If the content does look
+   like a scam, the user is warned that *their contact's account may have been
+   hacked* and told to call them back on a number they already know.
+2. **`SUSPICIOUS` never baits.** It warns the user, advises hanging up and
+   calling back on the number printed on their card or bill, and shows a
+   simulated alert to a family contact. No reply is ever sent.
+3. **A hard signal is required**, not just a score. Authority claim + urgency +
+   link clears 60 on arithmetic alone, and a real utility SMS produces exactly
+   that combination.
+4. **"This is genuine".** A button on the user's screen ends the engagement at
+   any moment. One neutral line goes out — *"Sorry, I got confused, please
+   continue."* — the session is marked `FALSE_POSITIVE`, it is never
+   re-escalated, and the user is offered the chance to add the caller to their
+   trusted contacts.
+5. **Self-release.** While engaged, the Guardian keeps scoring and lets go on
+   its own if the conversation turns out to be legitimate.
+
+**Measured accuracy**
+
+`npm test` prints this from 20 scam and 20 legitimate messages, on the rule
+layer alone — no LLM key, no network:
+
+```
+                      DECOY_ACTIVE  SUSPICIOUS  MONITORING
+  ----------------------------------------------------------
+  actual scam (20)                13           7           0
+  actual legitimate (20)           0           0          20
+  ----------------------------------------------------------
+  scam reaching DECOY_ACTIVE   13/20   (recall 65%)
+  scam flagged at all          20/20   (engaged or warned)
+  legitimate baited            0/20   (false-positive rate 0%)
+  precision on engagement      100%
+  slowest decision             4ms (budget 1500ms)
+```
+
+The legitimate half is deliberately hard: a real bank OTP SMS, a utility
+reminder that mentions disconnection, a courier update carrying a link, an
+insurance premium notice, a school fee receipt, a wrong number, and family
+messages in Marathi and Hindi. The highest score any of them reaches is 15.
+
+The 7 scams at `SUSPICIOUS` are *opening* messages — an authority claim with no
+demand attached yet. A separate test feeds each one the message that
+realistically follows, and every one escalates:
+
+```
+  UPI collect             40 SUSPICIOUS    ->   60 DECOY_ACTIVE
+  tech support apk        45 SUSPICIOUS    ->   80 DECOY_ACTIVE
+  TRAI SIM threat         50 SUSPICIOUS    ->   70 DECOY_ACTIVE
+  safe account lure       45 SUSPICIOUS    ->   75 DECOY_ACTIVE
+  video call arrest       35 SUSPICIOUS    ->   65 DECOY_ACTIVE
+```
+
+Raising single-message recall would mean lowering the hand-off bar. The
+zero-false-positive guarantee is worth more than an earlier takeover.
+
+**Hand-off**
+
+Four Socket.IO events, each scoped to a `session:<id>` room:
+
+| Event | When |
+|---|---|
+| `guardian.score` | every scored message, with the full breakdown |
+| `guardian.state_changed` | any transition, with the reasons |
+| `guardian.takeover` | the decoy has taken over |
+| `guardian.released` | the decoy let go, or never engaged |
+
+A client joins a room by emitting `watch` with a session id.
+
+On takeover the user's screen shows, in both languages:
+
+> Guardian has taken over this conversation. You don't need to reply.
+>
+> गार्डियनने हे संभाषण ताब्यात घेतले आहे. तुम्हाला उत्तर देण्याची गरज नाही.
+
+The scammer sees nothing change: the decoy continues the same thread in the
+same tone, and no marker, disclaimer or greeting is inserted at the switch.
+
+Every decision is budgeted at **1.5 seconds**. The rule layer runs in single
+digits of milliseconds; the classifier gets whatever is left minus a margin and
+is abandoned, not awaited, if it overruns. A test asserts the whole decision
+stays inside the budget even when the model takes 1.8 seconds to answer.
 
 ### Decoy
 
@@ -244,7 +389,9 @@ Every number the system reports is counted or clocked:
 - `engagementDurationSeconds` — real elapsed time between the first and last
   message, from the server's own receive clock
 - `messageCount`, `scammerMessageCount`, `decoyMessageCount` — counted
-- `confidence` — the sum of the weights listed above
+- `score` — the sum of the rule weights listed above, with the breakdown
+  that produced it; there is no separate probability
+- `decisionMs` — how long the Guardian actually took on this message
 - `newEntitiesThisTurn` — entities actually added this turn, with
   `newEntityTypesThisTurn` naming which kinds
 
@@ -349,9 +496,18 @@ assessment is still returned, so the console can show *why* nothing happened.
 
 | Route | Purpose |
 |---|---|
-| `GET /health` | no key required; reports whether an LLM and which database are wired up |
+| `GET /health` | no key required; reports whether an LLM, a database and a realtime transport are wired up |
 | `GET /api/sessions` | the 50 most recent sessions |
-| `GET /api/sessions/:sessionId` | one session in full, with its transcript |
+| `GET /api/sessions/:sessionId` | one session in full: transcript, entities, score breakdown, stage tags |
+| `POST /api/sessions/:sessionId/genuine` | the "This is genuine" button; ends the engagement, returns the neutral line |
+| `POST /api/sessions/:sessionId/end` | end an engagement explicitly |
+| `GET /api/trusted-contacts` | the protected user's trusted contacts |
+| `POST /api/trusted-contacts` | add one (identifier, label, relationship) |
+| `DELETE /api/trusted-contacts/:identifier` | remove one |
+
+A protected user is identified by `metadata.userId` on a message, or
+`?userId=` / the `x-user-id` header elsewhere. It defaults to `default-user`,
+so nothing breaks in a single-user demo.
 
 There is no outbound callback. The original posted every session to an external
 scoring endpoint; the report is produced locally instead.
@@ -371,6 +527,13 @@ scoring endpoint; the report is produced locally instead.
 | `PORT` | no | `8080` | |
 | `LOG_LEVEL` | no | `info` | `silent`, `error`, `warn`, `info`, `debug` |
 | `REPLY_DELAY_MS` | no | `0` | Cosmetic only; excluded from all metrics. |
+| `GUARDIAN_DECOY_THRESHOLD` | no | `60` | Score at or above which the decoy may engage. |
+| `GUARDIAN_SUSPICIOUS_THRESHOLD` | no | `30` | Score at or above which the user is warned. |
+| `GUARDIAN_RELEASE_THRESHOLD` | no | `30` | While engaged, a score below this plus a `legit` label releases. |
+
+The hard-signal requirement for a hand-off is **not** configurable. Lowering
+a threshold can make the Guardian warn more eagerly; it can never let three
+soft signals alone bait a real caller.
 
 ---
 
@@ -385,22 +548,30 @@ src/
     client.js                 the only LLM client: one key, one retry, a timeout
     errors.js                 LlmError with a code per failure mode
   agents/
-    guardian.js               text + stage signals, scoring, PASS/WATCH/ENGAGE policy
+    guardian.js               10 weighted signals, 6-state machine, hand-off policy
     decoy.js                  persona, objectives, pivot logic, output guardrails
   services/
     pipeline.js               one turn, end to end
     extractor.js              13 entity types, claiming + context rules, provenance
     stages.js                 9 script stages, keyword rules then one LLM call
     digits.js                 Devanagari digits, dictated numbers, money phrases
+    trustedContacts.js        per-user allow list, cached, normalised identifiers
     normalize.js              both transcript shapes -> one internal shape
     db.js                     MongoDB, optional
     logger.js
+  realtime/
+    events.js                 Socket.IO transport, plus null and recording emitters
+  models/
+    Session.js                session, transcript, entities, score breakdown
+    TrustedContact.js         one vouched-for number or handle per protected user
   middleware/auth.js          API key check, fails closed
   models/Session.js           session document and its measured metrics
   routes/api.js               HTTP surface
   public/                     placeholder page; the console lands here
 test/                         node:test suite, no test framework to install
-  scam-lines.test.js          15 realistic Indian scam lines, the regression bed
+  scam-lines.test.js          15 realistic Indian scam lines, the extraction bed
+  guardian-matrix.test.js     20 scam + 20 legitimate, prints the confusion matrix
+  fixtures/messages.js        that corpus, shared with any offline tooling
 docs/legacy/                  diagrams from the original project, unreferenced
 ```
 
@@ -516,6 +687,12 @@ enforce that:
   does not quietly weaken for the people most often targeted
 - every piece of evidence quotes the sentence it came from, so nothing in a
   report to the 1930 helpline has to be taken on trust
+- a saved contact is never baited, whatever a message scores; the worst case
+  for family is a warning that their own account may be compromised
+- the protected user can end an engagement at any moment, and the system
+  then stops treating that conversation as a scam permanently
+- the false-positive rate is measured and printed by the test suite rather
+  than asserted in prose
 
 A fuller ethics note, and the false-positive handling shown in the demo, land
 with the operator console.
