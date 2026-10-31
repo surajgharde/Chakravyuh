@@ -58,6 +58,22 @@ for (const field of Object.values(SUMMARY_FIELDS)) {
 // Tactic hints. Not evidence, and counted separately from identifiers.
 intelligenceShape.suspiciousKeywords = { type: [String], default: [] };
 
+/** One fact the persona has claimed, and when she claimed it. */
+const LedgerEntrySchema = new mongoose.Schema({
+    slot: { type: String, required: true },
+    value: { type: String, required: true },
+    source: { type: String, default: 'reply' }, // persona | reply
+    turn: { type: Number, default: 0 },
+    messageId: { type: String, default: null },
+    statedAt: { type: Date, default: Date.now },
+}, { _id: false });
+
+/** One use of a stalling excuse, for the cooldown window. */
+const ExcuseUseSchema = new mongoose.Schema({
+    id: { type: String, required: true },
+    turn: { type: Number, default: 0 },
+}, { _id: false });
+
 /** One rule signal that fired, with the weight it contributed. */
 const ScoreLineSchema = new mongoose.Schema({
     id: { type: String, required: true },
@@ -132,6 +148,17 @@ const SessionSchema = new mongoose.Schema({
     // Which identifier the decoy asked for last, so it can switch target
     // instead of repeating a question that went unanswered.
     lastAskedTarget: { type: String, default: null },
+
+    // Every fact the persona has claimed in this session. Injected into each
+    // prompt and checked against each draft, so she cannot contradict herself.
+    personaLedger: { type: [LedgerEntrySchema], default: [] },
+
+    // Which stalling excuses have been used, and on which decoy turn, so none
+    // is reused inside the cooldown window.
+    excuseHistory: { type: [ExcuseUseSchema], default: [] },
+
+    // The persona file in force for this session.
+    personaId: { type: String, default: 'default' },
 }, { timestamps: true });
 
 /**

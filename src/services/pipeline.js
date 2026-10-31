@@ -193,12 +193,14 @@ const handleTurn = async (body, deps = {}) => {
         if (scamType !== 'unknown') session.scamType = scamType;
     }
 
-    // The decoy stands down on its own limits, independently of the score.
+    // The engagement ends on its own terms: the other party leaves, or the
+    // session passes 30 minutes. There is no turn cap - a long engagement is
+    // the whole point.
     if (session.guardianState === guardian.STATES.DECOY_ACTIVE) {
-        const limit = decoy.shouldStandDown(session);
-        if (limit.standDown) {
+        const limit = decoy.shouldEnd(session, incoming.text);
+        if (limit.end) {
             await guardian.endSession({ session, events, reason: limit.reason });
-            logger.info(`Decoy stood down on session ${sessionId}: ${limit.reason}.`);
+            logger.info(`Engagement ended on session ${sessionId}: ${limit.reason}.`);
         }
     }
 
@@ -210,6 +212,8 @@ const handleTurn = async (body, deps = {}) => {
             history: session.messages.slice(0, -1),
             incomingText: incoming.text,
             llm,
+            config,
+            personaId: session.personaId || 'default',
         });
 
         session.messages.push({
@@ -221,9 +225,11 @@ const handleTurn = async (body, deps = {}) => {
         });
         session.messageCount += 1;
         session.decoyMessageCount += 1;
-        session.lastAskedTarget = decoyResult.askedFor === 'none' ? null : decoyResult.askedFor;
+        session.lastAskedTarget = decoyResult.targetAsked === 'none' ? null : decoyResult.targetAsked;
+        decoy.noteExcuseUsed(session, decoyResult.excuseUsed);
 
-        if (decoyResult.observed) session.agentNotes = decoyResult.observed;
+        session.markModified('personaLedger');
+        session.markModified('excuseHistory');
     }
 
     if (!session.agentNotes && verdict?.classifier.reasons.length > 0) {
@@ -233,10 +239,10 @@ const handleTurn = async (body, deps = {}) => {
     session.markModified('messages');
     await session.save();
 
-    // Optional cosmetic pause for a live demo. Defaults to 0, is reported
-    // separately, and is excluded from every engagement figure.
-    const replyDelayMs = Number.isFinite(config.replyDelayMs) ? config.replyDelayMs : 0;
-    if (replyDelayMs > 0 && decoyResult) await sleep(replyDelayMs);
+    // The decoy's typing delay. Zero under DEMO_MODE, reported separately,
+    // and excluded from every engagement figure.
+    const typingDelayMs = decoyResult ? decoyResult.typingDelayMs : 0;
+    if (typingDelayMs > 0) await sleep(typingDelayMs);
 
     return {
         sessionId,
@@ -270,7 +276,18 @@ const handleTurn = async (body, deps = {}) => {
         alerts: verdict ? verdict.alerts : [],
         takeoverNotice: verdict ? verdict.takeoverNotice : null,
         decoy: decoyResult
-            ? { askedFor: decoyResult.askedFor, source: decoyResult.source, violations: decoyResult.violations }
+            ? {
+                language: decoyResult.language,
+                targetAsked: decoyResult.targetAsked,
+                excuseUsed: decoyResult.excuseUsed,
+                ledgerUpdates: decoyResult.ledgerUpdates,
+                source: decoyResult.source,
+                pressure: decoyResult.pressure,
+                injectionAttempt: decoyResult.injectionAttempt,
+                contradictionsRejected: decoyResult.contradictionsRejected.length,
+                guard: decoyResult.guard,
+                typingDelayMs: decoyResult.typingDelayMs,
+            }
             : null,
         scriptStages: {
             thisMessage: messageStages,
@@ -283,7 +300,7 @@ const handleTurn = async (body, deps = {}) => {
             engagementDurationSeconds: session.engagementDurationSeconds(),
             newEntitiesThisTurn: merged.identifiers,
             newEntityTypesThisTurn: merged.types,
-            simulatedReplyDelayMs: replyDelayMs,
+            simulatedTypingDelayMs: typingDelayMs,
         },
         entitiesThisTurn: entities,
         intelligence: session.intelligence.toObject

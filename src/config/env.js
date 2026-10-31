@@ -60,9 +60,14 @@ const build = (raw = {}) => {
             timeoutMs: toInt(raw.LLM_TIMEOUT_MS, 20000),
         },
 
-        // Artificial pause before a decoy reply. Defaults to 0: it exists only so a
-        // live demo can look less robotic, is reported separately, and is never
-        // counted toward any engagement metric.
+        // DEMO_MODE=1 removes the decoy's typing delay, so a live demo does not
+        // stall while the persona "types". It changes nothing else.
+        demoMode: ['1', 'true', 'yes'].includes(String(raw.DEMO_MODE || '').trim().toLowerCase()),
+
+        // Explicit override for the decoy's typing delay, in milliseconds. Left
+        // at 0 the decoy picks a natural 1-3 seconds itself. Either way the
+        // pause is reported separately and never counted toward any engagement
+        // metric.
         replyDelayMs: toInt(raw.REPLY_DELAY_MS, 0),
 
         // Guardian thresholds on the 0-100 rule score. A hand-off additionally

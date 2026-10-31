@@ -202,7 +202,11 @@ const amountPattern = () => new RegExp(
 
 const caseRefPattern = () => new RegExp(
     `(?:${CASE_WORDS.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`
-    + '\\s*(?:no\\.?|number|nmbr|क्रमांक|नंबर)?\\s*[:#\\-]?\\s*'
+    + '\\s*(?:no\\.?|number|nmbr|क्रमांक|नंबर)?\\s*'
+    // A copula is allowed between the label and the value: "the case number IS
+    // MUM/CYB/2026/00891" is how a caller actually says it out loud.
+    + '(?:is|was|are|hai|aahe|ahe|आहे|है)?\\s*'
+    + '[:#\\-]?\\s*'
     + '([A-Z0-9][A-Z0-9/\\-]{3,24})',
     'giu'
 );
