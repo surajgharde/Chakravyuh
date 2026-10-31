@@ -600,13 +600,40 @@ const summarize = (entities) => {
  * keyword is a tactic hint and not evidence.
  */
 const mergeInto = (session, entities) => {
-    const existing = new Set((session.entities || []).map((e) => `${e.type}:${e.normalized}`));
-    const fresh = entities.filter((e) => !existing.has(`${e.type}:${e.normalized}`));
+    const byKey = new Map();
+    for (const entity of session.entities || []) {
+        byKey.set(`${entity.type}:${entity.normalized}`, entity);
+    }
+
+    const fresh = [];
+    let repeats = 0;
+
+    for (const entity of entities) {
+        const key = `${entity.type}:${entity.normalized}`;
+        const already = byKey.get(key);
+
+        if (already) {
+            // The record keeps the FIRST sighting's provenance, because that is
+            // what an evidence report quotes. The count is what shows a number
+            // was said again.
+            already.occurrences = (already.occurrences || 1) + 1;
+            already.lastSeenAt = entity.timestamp ?? already.lastSeenAt;
+            already.lastMessageId = entity.messageId ?? already.lastMessageId;
+            repeats += 1;
+            continue;
+        }
+
+        const record = { ...entity, occurrences: 1, lastSeenAt: entity.timestamp, lastMessageId: entity.messageId };
+        fresh.push(record);
+        byKey.set(key, record);
+    }
+
+    if (fresh.length > 0 || repeats > 0) {
+        if (fresh.length > 0) session.entities.push(...fresh);
+        session.markModified('entities');
+    }
 
     if (fresh.length > 0) {
-        session.entities.push(...fresh);
-        session.markModified('entities');
-
         const summary = summarize(session.entities);
         for (const [field, values] of Object.entries(summary)) {
             session.intelligence[field] = values;
@@ -614,7 +641,11 @@ const mergeInto = (session, entities) => {
         session.markModified('intelligence');
     }
 
-    return { identifiers: fresh.length, types: [...new Set(fresh.map((e) => e.type))] };
+    return {
+        identifiers: fresh.length,
+        repeats,
+        types: [...new Set(fresh.map((e) => e.type))],
+    };
 };
 
 /** True when the session holds at least one hard identifier. */

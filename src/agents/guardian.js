@@ -299,6 +299,8 @@ const MAX_SCORE = 100;
  * extractor.
  */
 const SCAM_TYPE_PATTERNS = {
+    sextortion: /\b(nude|naked|obscene (?:video|photo|clip)|screen recording of you|morph\w*|intimate (?:video|photo)|viral kar|leak (?:your )?video)\b/i,
+    loan_app_scam: /\b(instant loan|loan app|pre[\s-]?approved loan|loan sanction\w*|emi (?:due|pending)|recovery agent|loan settlement)\b/i,
     digital_arrest: /\b(cbi|narcotics|ncb|arrest|warrant|fir|custody|enforcement directorate|money laundering)\b/i,
     upi_fraud: /\b(upi|vpa|paytm|gpay|google pay|phonepe|collect request|qr code|cashback)\b/i,
     bank_fraud: /\b(sbi|hdfc|icici|axis|kotak|bank|account|kyc|debit card|credit card|net banking|rbi)\b/i,
@@ -592,6 +594,7 @@ const buildAlerts = ({ state, trusted, looksLikeScam, score }) => {
  * @param {object} params.thresholds    optional threshold overrides
  * @param {string} params.from          the caller's number or handle
  * @param {string} params.userId        the protected user
+ * @param {string} params.messageId     the message being scored, for the log
  */
 const handleMessage = async ({
     session,
@@ -605,6 +608,7 @@ const handleMessage = async ({
     thresholds: thresholdOverrides = {},
     from = null,
     userId = trustedContacts.DEFAULT_USER_ID,
+    messageId = null,
 }) => {
     const startedAt = Date.now();
     const thresholds = { ...DEFAULT_THRESHOLDS, ...thresholdOverrides };
@@ -687,6 +691,27 @@ const handleMessage = async ({
     session.userId = userId;
 
     const changed = state !== previousState;
+
+    // Every decision is logged, not just the latest one. A cybercrime unit
+    // reading the report has to be able to see when the system decided to
+    // engage and on what basis.
+    if (Array.isArray(session.guardianLog)) {
+        session.guardianLog.push({
+            at: new Date(),
+            messageId,
+            score: scored.score,
+            state,
+            previousState,
+            stateChanged: changed,
+            firedSignals: scored.fired,
+            hardSignals: scored.hardSignals,
+            classifierLabel: classifier.label,
+            classifierReasons: classifier.reasons,
+            notes,
+            decisionMs,
+        });
+        if (session.markModified) session.markModified('guardianLog');
+    }
     const engagedNow = changed && state === STATES.DECOY_ACTIVE;
 
     if (engagedNow) {

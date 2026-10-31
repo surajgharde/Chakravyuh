@@ -48,6 +48,13 @@ const EntitySchema = new mongoose.Schema({
     sentence: { type: String, default: '' },
     method: { type: String, default: 'rules' },
     meta: { type: mongoose.Schema.Types.Mixed, default: undefined },
+
+    // How many times this identifier was said. The record itself is kept once,
+    // with the FIRST sighting's provenance, because that is what an evidence
+    // report quotes; the count is what shows a number was repeated.
+    occurrences: { type: Number, default: 1 },
+    lastSeenAt: { type: Date, default: null },
+    lastMessageId: { type: String, default: null },
 }, { _id: false });
 
 /** The flat per-type lists, built from SUMMARY_FIELDS so the two cannot drift. */
@@ -57,6 +64,28 @@ for (const field of Object.values(SUMMARY_FIELDS)) {
 }
 // Tactic hints. Not evidence, and counted separately from identifiers.
 intelligenceShape.suspiciousKeywords = { type: [String], default: [] };
+
+/**
+ * One Guardian decision, kept per scored message.
+ *
+ * The report needs the whole decision history, not just the latest score: a
+ * cybercrime unit reading it has to be able to see when the system decided to
+ * engage and on what basis.
+ */
+const GuardianLogEntrySchema = new mongoose.Schema({
+    at: { type: Date, default: Date.now },
+    messageId: { type: String, default: null },
+    score: { type: Number, required: true },
+    state: { type: String, required: true },
+    previousState: { type: String, default: null },
+    stateChanged: { type: Boolean, default: false },
+    firedSignals: { type: [String], default: [] },
+    hardSignals: { type: [String], default: [] },
+    classifierLabel: { type: String, default: 'unavailable' },
+    classifierReasons: { type: [String], default: [] },
+    notes: { type: [String], default: [] },
+    decisionMs: { type: Number, default: 0 },
+}, { _id: false });
 
 /** One fact the persona has claimed, and when she claimed it. */
 const LedgerEntrySchema = new mongoose.Schema({
@@ -112,6 +141,9 @@ const SessionSchema = new mongoose.Schema({
     handoffAtMessage: { type: Number, default: null }, // message index of the hand-off
     takeoverAt: { type: Date, default: null },
 
+    // Every scored message, in order. The evidence report prints this.
+    guardianLog: { type: [GuardianLogEntrySchema], default: [] },
+
     // Set when the protected user pressed "This is genuine".
     falsePositive: {
         markedAt: { type: Date, default: null },
@@ -159,6 +191,20 @@ const SessionSchema = new mongoose.Schema({
 
     // The persona file in force for this session.
     personaId: { type: String, default: 'default' },
+
+    /**
+     * The report is never filed automatically and never marked ready to file
+     * until a family member has actually read it.
+     */
+    report: {
+        reviewedByFamily: { type: Boolean, default: false },
+        reviewedAt: { type: Date, default: null },
+        reviewedBy: { type: String, default: null }, // an alias or relationship, never a real name
+    },
+
+    // Alias used in every report. The protected user's real name and number
+    // never appear in an exported document.
+    userAlias: { type: String, default: null },
 }, { timestamps: true });
 
 /**

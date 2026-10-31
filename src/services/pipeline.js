@@ -183,6 +183,7 @@ const handleTurn = async (body, deps = {}) => {
             thresholds: config.guardianThresholds || {},
             from,
             userId,
+            messageId,
         })
         : null;
 
