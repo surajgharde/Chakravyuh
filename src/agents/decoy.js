@@ -365,8 +365,13 @@ const TYPING_DELAY = { minMs: 1000, maxMs: 3000 };
  *
  * DEMO_MODE=1 sets it to zero so a live demo does not stall. It is reported
  * separately and never counted toward any engagement metric.
+ *
+ * `config.live` is a spoken call. There is no typing to simulate when someone
+ * is talking, and a two-second gap of silence before every answer is the
+ * opposite of believable, so the delay is zero there too.
  */
 const typingDelayMs = (config = {}) => {
+    if (config.live) return 0;
     if (config.demoMode) return 0;
     if (Number.isFinite(config.replyDelayMs) && config.replyDelayMs > 0) return config.replyDelayMs;
     const span = TYPING_DELAY.maxMs - TYPING_DELAY.minMs;
@@ -685,10 +690,43 @@ const fallbackReply = ({ target, pressure, excuse, language = 'English' }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+/** How much of a blocked draft is kept. Enough to recognise, not to reuse. */
+const AUDIT_EXCERPT_CHARS = 160;
+
+/**
+ * Prepares a blocked draft to be stored.
+ *
+ * A draft is blocked precisely because of what is in it, so storing it verbatim
+ * would move the leak from the wire into the database and from there into the
+ * evidence report. Every digit is masked and every link defanged first, so what
+ * is kept shows the *shape* of the mistake - which is what an auditor needs -
+ * without carrying the thing that was dangerous.
+ */
+const redactForAudit = (draft) => String(draft || '')
+    .slice(0, AUDIT_EXCERPT_CHARS)
+    .replace(/\d/g, '#')
+    .replace(/\b(?:https?|hxxps?):\/\/\S+/gi, '[link removed]')
+    .replace(/\b[\w.-]{2,}@[\w.-]{2,}\b/g, '[handle removed]')
+    .trim();
+
+// ---------------------------------------------------------------------------
 // The turn
 // ---------------------------------------------------------------------------
 
-const MAX_DRAFTS = 2; // one draft, then one redraft if it contradicted the ledger
+/**
+ * How many times the model is asked for a reply before the decoy gives up and
+ * says a scripted line instead.
+ *
+ * An attempt is spent on either failure: a draft that contradicted the facts
+ * ledger, or a draft the output guard blocked. Both get told what was wrong and
+ * asked again. Two is the whole budget, because a caller is waiting - and a
+ * model that has produced a credential leak twice in a row is not about to
+ * stop on the third try.
+ */
+const MAX_DRAFTS = 2;
 
 /**
  * Produces the decoy's next reply.
@@ -698,7 +736,7 @@ const MAX_DRAFTS = 2; // one draft, then one redraft if it contradicted the ledg
  * @param {object[]} params.history     messages so far, oldest first
  * @param {string} params.incomingText  the caller's newest message
  * @param {object} params.llm           LlmClient, or null
- * @param {object} params.config        { demoMode, replyDelayMs }
+ * @param {object} params.config        { demoMode, replyDelayMs, live }
  * @param {string} params.personaId
  */
 const respond = async ({
@@ -731,6 +769,13 @@ const respond = async ({
         session, persona, target, excuse, language, pressure, injection,
     });
 
+    // The real values that must never appear in a reply, for this session.
+    const protectedIdentifiers = outputGuard.protectedIdentifiersFor(session);
+
+    // Every draft the guard threw away this turn, in order. Surfaced on the
+    // turn and written to the session so a blocked reply is auditable.
+    const guardBlocks = [];
+
     const base = {
         language: language.language,
         script: language.script,
@@ -742,16 +787,31 @@ const respond = async ({
         typingDelayMs: typingDelayMs(config),
         ledgerUpdates: [],
         contradictionsRejected: [],
-        guard: { verdict: outputGuard.VERDICTS.PASS, violations: [] },
+        guard: { verdict: outputGuard.VERDICTS.PASS, violations: [], blockedDrafts: 0 },
+        guardBlocks,
     };
 
-    const useFallback = (note) => {
+    /**
+     * Gives up on the model and says a scripted line.
+     *
+     * `blockedBy` carries the violations that caused the fall-back, so what
+     * comes back still says *why* the model's own reply was thrown away. Losing
+     * that would make a blocked credential leak indistinguishable from an LLM
+     * timeout on the intelligence panel, and the two want very different
+     * reactions from whoever is watching.
+     */
+    const useFallback = (note, blockedBy = []) => {
         const { text, targetAsked, excuseUsed } = fallbackReply({
             target, pressure, excuse, language: language.language,
         });
-        const reviewed = outputGuard.review(text, { sessionId: session.sessionId, persona });
-        const safe = reviewed.verdict === outputGuard.VERDICTS.BLOCK
-            ? inLanguage(FALLBACK_REPLIES.none, language.language)
+
+        const reviewed = outputGuard.review(text, { sessionId: session.sessionId, persona, protectedIdentifiers });
+
+        // The scripted lines are all guard-clean and a test holds them that
+        // way, so this is belt and braces: if one ever stops being safe, the
+        // content-free stall line goes out instead of it.
+        const safe = reviewed.blocked
+            ? outputGuard.safeStall(language.language)
             : reviewed.text;
 
         return {
@@ -761,7 +821,12 @@ const respond = async ({
             excuseUsed,
             source: 'fallback',
             note,
-            guard: { verdict: reviewed.verdict, violations: reviewed.violations },
+            guard: {
+                verdict: blockedBy.length > 0 ? outputGuard.VERDICTS.BLOCK : reviewed.verdict,
+                violations: [...blockedBy, ...reviewed.violations],
+                blockedDrafts: guardBlocks.length,
+            },
+            guardBlocks,
         };
     };
 
@@ -780,14 +845,30 @@ const respond = async ({
             { role: 'user', content: wrapIncoming(incomingText) },
         ];
 
+        // Tell the model what was wrong with the last attempt. A bare "try
+        // again" gets the same draft back; naming the rule it broke is what
+        // makes the second attempt different from the first.
         if (attempt > 1) {
-            const last = contradictionsRejected[contradictionsRejected.length - 1];
-            messages.push({
-                role: 'system',
-                content: 'Your previous draft contradicted what you have already told this caller: '
-                    + last.conflicts.map((c) => `you said ${c.label} is "${c.onRecord}" but the draft said "${c.inDraft}"`).join('; ')
-                    + '. Write it again, consistent with the record above.',
-            });
+            const lastBlock = guardBlocks[guardBlocks.length - 1];
+            const lastConflict = contradictionsRejected[contradictionsRejected.length - 1];
+
+            if (lastBlock && lastBlock.attempt === attempt - 1) {
+                messages.push({
+                    role: 'system',
+                    content: 'Your previous draft was blocked and not sent: '
+                        + lastBlock.violations.map((v) => v.reason).join(' ')
+                        + ' Write a different reply. Do not include any number, link, app name, '
+                        + 'payment confirmation, threat, or claim about who you are. Stay in '
+                        + 'character and keep stalling.',
+                });
+            } else if (lastConflict) {
+                messages.push({
+                    role: 'system',
+                    content: 'Your previous draft contradicted what you have already told this caller: '
+                        + lastConflict.conflicts.map((c) => `you said ${c.label} is "${c.onRecord}" but the draft said "${c.inDraft}"`).join('; ')
+                        + '. Write it again, consistent with the record above.',
+                });
+            }
         }
 
         let result;
@@ -815,10 +896,30 @@ const respond = async ({
             return { ...useFallback('Draft contradicted the ledger twice.'), contradictionsRejected };
         }
 
-        // The output guard has the final say.
-        const reviewed = outputGuard.review(draft, { sessionId: session.sessionId, persona });
-        if (reviewed.verdict === outputGuard.VERDICTS.BLOCK) {
-            return { ...useFallback('Output guard blocked the draft.'), contradictionsRejected };
+        // The output guard has the final say. A block costs an attempt and the
+        // model is asked again, with the reason; only once the attempts are
+        // gone does a scripted line go out.
+        const reviewed = outputGuard.review(draft, {
+            sessionId: session.sessionId, persona, protectedIdentifiers,
+        });
+
+        if (reviewed.blocked) {
+            guardBlocks.push({
+                attempt,
+                at: new Date(),
+                violations: reviewed.violations,
+                // The draft is kept for audit with every digit masked. The
+                // whole point of the block was that those digits must not
+                // leave the process, and that includes into the database and
+                // the evidence report.
+                redactedDraft: redactForAudit(draft),
+            });
+
+            if (attempt < MAX_DRAFTS) continue;
+            return {
+                ...useFallback('Output guard blocked every draft.', reviewed.violations),
+                contradictionsRejected,
+            };
         }
 
         // Record what the reply claimed about her, so later turns stay consistent.
@@ -861,7 +962,12 @@ const respond = async ({
             ledgerUpdates: recorded.map(({ slot, value }) => ({ slot, value })),
             contradictionsRejected,
             source: 'llm',
-            guard: { verdict: reviewed.verdict, violations: reviewed.violations },
+            guard: {
+                verdict: reviewed.verdict,
+                violations: reviewed.violations,
+                blockedDrafts: guardBlocks.length,
+            },
+            guardBlocks,
         };
     }
 
@@ -890,6 +996,8 @@ module.exports = {
     typingDelayMs,
     buildSystemPrompt,
     wrapIncoming,
+    redactForAudit,
+    MAX_DRAFTS,
     PERSONA,
     TARGETS,
     EXCUSES,

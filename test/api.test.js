@@ -11,6 +11,7 @@ const { build } = require('../src/config/env');
 const { createApp } = require('../src/app');
 const { LlmClient } = require('../src/llm/client');
 const Session = require('../src/models/Session');
+const { recordingEmitter } = require('../src/realtime/events');
 
 const API_KEY = 'test-api-secret-key';
 
@@ -780,4 +781,198 @@ test('the network view is empty rather than broken when nothing matches', async 
     assert.equal(graph.status, 'success');
     assert.deepEqual(graph.nodes, []);
     assert.deepEqual(graph.clusters, []);
+});
+
+// ---------------------------------------------------------------------------
+// Call mode: partial transcripts
+// ---------------------------------------------------------------------------
+
+/**
+ * These drive the pipeline the way Call mode does: several partials of one
+ * sentence while the caller is "still speaking", then the finished sentence.
+ */
+const partial = (sessionId, text, metadata = {}) => post('/api/partial', {
+    sessionId,
+    text,
+    metadata: { channel: 'Call', locale: 'IN', ...metadata },
+});
+
+test('a partial transcript needs a sessionId and some text', async () => {
+    assert.equal((await post('/api/partial', { text: 'hello' })).status, 400);
+    assert.equal((await post('/api/partial', { sessionId: 'p-0' })).status, 400);
+    assert.equal((await post('/api/partial', { sessionId: 'p-0', text: '   ' })).status, 400);
+});
+
+test('a partial hands off before the sentence is finished', async () => {
+    const half = 'Madam this is Inspector Deshmukh from CBI Pune, a parcel in your name was '
+        + 'seized with narcotics, do not tell anyone, share the OTP';
+
+    const body = await (await partial('p-takeover', half)).json();
+
+    assert.equal(body.status, 'success');
+    assert.equal(body.partial, true);
+    assert.equal(body.state, 'DECOY_ACTIVE');
+    assert.equal(body.guardian.takeover, true);
+    assert.ok(body.takeoverNotice, 'the user is told, mid-sentence');
+
+    // The classifier is not consulted on a fragment.
+    assert.equal(body.guardian.classifier.available, false);
+});
+
+test('a partial records no message, no entity and no reply', async () => {
+    const half = 'Transfer Rs 2,50,000 to account 50100234567890, IFSC SBIN0001234, '
+        + 'and share the OTP immediately, do not disconnect';
+
+    const body = await (await partial('p-clean', half)).json();
+
+    // The fragment's identifiers come back, so the console can show them
+    // surfacing as they are spoken...
+    assert.ok(body.entitiesThisPartial.length > 0);
+    assert.equal(body.reply, undefined, 'a partial never carries a reply');
+
+    // ...but nothing was written to the session.
+    const session = await Session.findOne({ sessionId: 'p-clean' });
+    assert.equal(session.messages.length, 0, 'a half-sentence was recorded as a message');
+    assert.equal(session.messageCount, 0);
+    assert.equal(session.entities.length, 0, 'a fragment filed an identifier with a fragment as provenance');
+    assert.equal(session.decoyMessageCount, 0);
+
+    // The state, though, is written: that is the whole point.
+    assert.equal(session.guardianState, 'DECOY_ACTIVE');
+});
+
+test('repeated partials of one sentence log one decision, not one per partial', async () => {
+    const stem = 'Madam a non-bailable warrant is ready against you, do not tell anyone, share the OTP';
+
+    await partial('p-log', stem);
+    await partial('p-log', `${stem} now`);
+    await partial('p-log', `${stem} now madam`);
+    await partial('p-log', `${stem} now madam please`);
+
+    const session = await Session.findOne({ sessionId: 'p-log' });
+    const partials = session.guardianLog.filter((entry) => entry.partial);
+
+    assert.equal(partials.length, 1, 'every two seconds of speech produced a log line');
+    assert.equal(partials[0].stateChanged, true);
+    assert.equal(partials[0].messageId, null);
+});
+
+test('the finished sentence arrives at a session that is already engaged, so the decoy answers at once', async () => {
+    // What the recogniser has heard two seconds in, and the whole sentence.
+    const heardSoFar = 'Madam share the OTP immediately, your account will be blocked today';
+    const sentence = `${heardSoFar}, and transfer Rs 2,50,000 to account 50100234567890`;
+
+    // While they are talking.
+    const scored = await (await partial('p-answer', heardSoFar)).json();
+    assert.equal(scored.state, 'DECOY_ACTIVE', 'the hand-off happened on the partial');
+
+    // The sentence lands.
+    const turn = await (await post('/api/message', {
+        sessionId: 'p-answer',
+        live: true,
+        message: { sender: 'scammer', text: sentence, timestamp: Date.now() },
+        metadata: { channel: 'Call', locale: 'IN' },
+    })).json();
+
+    assert.equal(turn.live, true);
+    assert.ok(turn.reply && turn.reply.length > 0, 'the decoy answered the finished sentence');
+
+    // A spoken turn waits for nothing it does not have to.
+    assert.equal(turn.measured.simulatedTypingDelayMs, 0, 'a spoken reply must not sit on a typing delay');
+    assert.ok(turn.scriptStages.thisMessage.every((tag) => tag.method === 'rules'),
+        'a spoken turn skips the stage tagger\'s model call');
+
+    // And the sentence is in the transcript exactly once, in full.
+    const session = await Session.findOne({ sessionId: 'p-answer' });
+    const spoken = session.messages.filter((m) => m.role === 'scammer');
+    assert.equal(spoken.length, 1);
+    assert.equal(spoken[0].text, sentence);
+});
+
+test('a typed turn keeps the stage tagger, so the live flag changed nothing else', async () => {
+    const turn = await (await post('/api/message', {
+        sessionId: 'p-typed',
+        message: {
+            sender: 'scammer',
+            text: 'URGENT: Your SBI account will be blocked today. Share the OTP immediately.',
+            timestamp: Date.now(),
+        },
+        metadata: { channel: 'WhatsApp', locale: 'IN' },
+    })).json();
+
+    assert.equal(turn.live, false);
+    assert.ok(turn.reply);
+});
+
+test('a partial does not move the engagement clock', async () => {
+    const sentence = 'Madam, share the OTP immediately, do not tell anyone, do not disconnect';
+
+    await partial('p-clock', sentence);
+    const created = await Session.findOne({ sessionId: 'p-clock' });
+    const lastSeenAt = created.lastSeenAt.getTime();
+
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await partial('p-clock', `${sentence} now`);
+
+    const after = await Session.findOne({ sessionId: 'p-clock' });
+    assert.equal(after.lastSeenAt.getTime(), lastSeenAt,
+        'silence between partials was counted as engagement time');
+    assert.equal(after.engagementDurationSeconds(), 0, 'nothing has been said yet, in messages');
+});
+
+test('a partial of an ordinary sentence is left alone, like any other', async () => {
+    const body = await (await partial('p-legit', 'Maa, what is for dinner today, I will reach home by')).json();
+
+    assert.equal(body.state, 'MONITORING');
+    assert.equal(body.guardian.takeover, false);
+    assert.equal(body.alerts.length, 0);
+});
+
+test('a partial never lowers the state the Guardian already reached', async () => {
+    await partial('p-hold', 'Madam share the OTP immediately, your account will be blocked today');
+    const engaged = await Session.findOne({ sessionId: 'p-hold' });
+    assert.equal(engaged.guardianState, 'DECOY_ACTIVE');
+
+    // The next thing the recogniser hears is harmless. An engaged session
+    // holding through a quiet fragment is the once-engaged rule; a partial that
+    // would have dropped a *warning* is held by the rung guard, which
+    // voice.test.js covers directly.
+    const body = await (await partial('p-hold', 'haan, one minute madam')).json();
+
+    assert.equal(body.state, 'DECOY_ACTIVE', 'the engagement was dropped mid-call');
+    assert.equal(body.guardian.changed, false);
+    assert.equal((await Session.findOne({ sessionId: 'p-hold' })).guardianState, 'DECOY_ACTIVE');
+});
+
+test('a partial emits the transcript so a second screen can show it', async () => {
+    // The emitter the app is mounted with records rather than transports, so
+    // this is the event a `?view=intel` window would receive.
+    const events = recordingEmitter();
+    const config = build({ API_SECRET_KEY: API_KEY, MONGO_URI: mongoServer.getUri(), PORT: '0', DEMO_MODE: '1' });
+    const app = createApp(config, { llm: stubLlm(), events });
+
+    const local = await new Promise((resolve) => {
+        const s = app.listen(0, () => resolve(s));
+    });
+    const url = `http://127.0.0.1:${local.address().port}`;
+
+    await fetch(`${url}/api/partial`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': API_KEY },
+        body: JSON.stringify({
+            sessionId: 'p-events',
+            text: 'Madam share the OTP immediately, do not tell anyone',
+            metadata: { channel: 'Call', locale: 'IN' },
+        }),
+    });
+    local.close();
+
+    const transcripts = events.of('call.transcript');
+    assert.equal(transcripts.length, 1);
+    assert.equal(transcripts[0].payload.sessionId, 'p-events');
+    assert.equal(transcripts[0].payload.final, false, 'a partial must never be sent as final');
+    assert.match(transcripts[0].payload.text, /share the OTP/);
+
+    // And the Guardian's own events came out too, marked as partials.
+    assert.ok(events.of('guardian.score').every((e) => e.payload.partial === true));
 });

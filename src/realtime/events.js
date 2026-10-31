@@ -11,14 +11,20 @@
  *   guardian.takeover       the decoy has taken the conversation over
  *   guardian.released       the decoy has let go, or was never engaged
  *
- * Plus one transport event for the console:
+ * Plus two transport events for the console:
  *
  *   session.turn            the whole completed turn
+ *   call.transcript         a partial transcript from a simulated voice call
  *
  * The four guardian events are the agent's own decisions. session.turn exists
  * so a second screen showing only the intelligence panel can stay live without
  * having sent the message itself - without it, that screen would see scores
  * change but never learn what was extracted.
+ *
+ * call.transcript carries what the scammer is in the middle of saying, so the
+ * live transcript reaches a second screen that is not holding the microphone.
+ * It is scored but never recorded: the sentence enters the transcript only when
+ * speech recognition marks it final and it arrives as a normal message.
  */
 
 const EVENTS = {
@@ -27,6 +33,7 @@ const EVENTS = {
     TAKEOVER: 'guardian.takeover',
     RELEASED: 'guardian.released',
     TURN: 'session.turn',
+    TRANSCRIPT: 'call.transcript',
 };
 
 /** Discards everything. Used when no transport is wired up. */

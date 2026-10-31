@@ -2,6 +2,8 @@
  * HTTP surface.
  *
  * POST /api/message                     one inbound message
+ * POST /api/partial                     a partial transcript from a voice call;
+ *                                       scored, never recorded
  * POST /api/sessions/:id/genuine        the "This is genuine" button
  * POST /api/sessions/:id/end            end an engagement
  * GET  /api/sessions/:id                full session state
@@ -196,6 +198,28 @@ const createRouter = (deps) => {
             }
             logger.error(`Turn failed: ${error.stack || error.message}`);
             res.status(500).json({ status: 'error', error: 'Internal error handling message.' });
+        }
+    });
+
+    /**
+     * A partial transcript from Call mode.
+     *
+     * Called roughly every two seconds while the scammer is still speaking, so
+     * detection does not have to wait for them to finish. It runs the Guardian
+     * and nothing else: no message is recorded, no entity stored and no decoy
+     * reply produced. See pipeline.handlePartial for exactly what it will and
+     * will not do.
+     */
+    router.post('/partial', async (req, res) => {
+        try {
+            const result = await pipeline.handlePartial(req.body, deps);
+            res.json({ status: 'success', ...result });
+        } catch (error) {
+            if (error.name === 'PipelineError') {
+                return res.status(error.status).json({ status: 'error', error: error.message });
+            }
+            logger.error(`Partial failed: ${error.stack || error.message}`);
+            res.status(500).json({ status: 'error', error: 'Internal error handling the partial transcript.' });
         }
     });
 

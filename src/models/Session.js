@@ -71,10 +71,16 @@ intelligenceShape.suspiciousKeywords = { type: [String], default: [] };
  * The report needs the whole decision history, not just the latest score: a
  * cybercrime unit reading it has to be able to see when the system decided to
  * engage and on what basis.
+ *
+ * `partial` marks a decision taken on a half-finished sentence during a voice
+ * call. Those are logged only when they moved the state, and marked as such,
+ * because the text they were taken on is not in the transcript - speech
+ * recognition had not finished the sentence yet.
  */
 const GuardianLogEntrySchema = new mongoose.Schema({
     at: { type: Date, default: Date.now },
     messageId: { type: String, default: null },
+    partial: { type: Boolean, default: false },
     score: { type: Number, required: true },
     state: { type: String, required: true },
     previousState: { type: String, default: null },

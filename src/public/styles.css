@@ -94,6 +94,42 @@
   align-items: center;
 }
 
+/* --- call mode ----------------------------------------------------------- */
+
+/*
+ * The bubble for a sentence that is still being spoken. Dashed, because it is
+ * not in the transcript yet and must not look like it is.
+ */
+.bubble-live {
+  background: #fffaf7;
+  border: 1px dashed #d8a893;
+  color: #7a3419;
+}
+
+/* A blinking block after the live text, so a silent pause still reads as a
+   live microphone rather than a frozen pane. */
+.caret {
+  animation: blink 1.05s step-end infinite;
+  color: #8c3b1e;
+  margin-left: 1px;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* The red dot on the SIMULATED CALL badge, while a call is live. */
+#call-badge:not(.hidden) { animation: call-pulse 1.9s ease-in-out infinite; }
+
+@keyframes call-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+/* The part of the live transcript the recogniser has not committed to. */
+.interim { color: #8c3b1e; opacity: 0.72; }
+
 /* --- score breakdown ----------------------------------------------------- */
 
 .signal-row {
@@ -230,6 +266,12 @@ body.judge-mode #pane-scammer { flex: 1 1 auto !important; }
 body.intel-only #pane-phone,
 body.intel-only #pane-scammer { display: none; }
 body.intel-only #pane-intel { flex: 1 1 auto; }
+
+/*
+ * Judge mode hides the intelligence pane, so the live transcript has to be
+ * readable in the two that are left. The scammer pane's copy carries it.
+ */
+body.judge-mode #call-live { font-size: 13px; }
 
 /* --- a narrower projector or a laptop ------------------------------------ */
 

@@ -17,11 +17,13 @@ persona, scoring and reporting have been rebuilt — see
 
 ## Status
 
-Phases 1 to 4 are complete: the repo is cleaned up, the scoring hacks are gone,
+Phases 1 to 7 are complete: the repo is cleaned up, the scoring hacks are gone,
 the three agents are wired end to end behind a working API, extraction produces
 auditable evidence in English, Hindi and Marathi, the Guardian owns the session
-state with a measured zero false-positive rate on its test corpus, and the decoy
-holds a consistent persona across long conversations in all three languages.
+state with a measured zero false-positive rate on its test corpus, the decoy
+holds a consistent persona across long conversations in all three languages, the
+evidence report and the cross-session view are built, and the demo console can
+be driven by voice.
 
 | Part | State |
 |---|---|
@@ -31,9 +33,10 @@ holds a consistent persona across long conversations in all three languages.
 | Output guard | the seam is in and enforcing the critical rules; full version is Phase 8 |
 | Entity extraction — 13 types, full provenance | working; the original's false positives are fixed and under test |
 | Script stage tagging — 9 stages, rules then LLM | working |
-| Intelligence report for 1930 / cybercrime.gov.in | not yet built |
-| Cross-session identifier linking | not yet built |
-| Operator console for the live demo | not yet built; a placeholder page is served |
+| Intelligence report for 1930 / cybercrime.gov.in | working; HTML and PDF, gated on a family review |
+| Cross-session identifier linking | working; the network view |
+| Operator console for the live demo | working; three panes, scenario buttons, a second-screen view |
+| Call mode — a simulated voice call | working, **Chrome only**; see [Call mode](#call-mode--a-simulated-voice-call) |
 
 ---
 
@@ -66,9 +69,13 @@ Both paths log that they are degraded, and the API reports
 model response.
 
 ```bash
-npm test     # 282 tests, no network and no LLM key needed
+npm test     # 444 tests, no network and no LLM key needed
 npm run dev  # restart on change
 ```
+
+Open <http://localhost:8080> for the demo console. **Use Chrome if you want
+Call mode**, the simulated voice call: it needs the Web Speech recogniser, which
+no other browser ships. Everything else on the page works in any browser.
 
 ---
 
@@ -266,6 +273,12 @@ Four Socket.IO events, each scoped to a `session:<id>` room:
 | `guardian.state_changed` | any transition, with the reasons |
 | `guardian.takeover` | the decoy has taken over |
 | `guardian.released` | the decoy let go, or never engaged |
+
+Each carries `partial: true` when the decision was taken on a half-finished
+sentence during a voice call, so a console can show a score that came from one
+as exactly that. Two more events exist for the console rather than the agents:
+`session.turn`, the whole completed turn, and `call.transcript`, the live
+transcript of a simulated call.
 
 A client joins a room by emitting `watch` with a session id.
 
@@ -516,6 +529,163 @@ Every number the system reports is counted or clocked:
 It defaults to `0`, is reported separately as `simulatedReplyDelayMs`, and is
 excluded from every engagement figure.
 
+### Call mode — a simulated voice call
+
+**Call mode needs Chrome.** It is the only browser that ships the Web Speech
+recogniser (`webkitSpeechRecognition`); in Firefox or Safari the Start call
+button is disabled and says so, and the typed console works everywhere.
+
+Call mode drives the same pipeline from the laptop microphone instead of the
+composer. Nothing about detection, the persona or the report changes — the
+scammer's words arrive as speech rather than as typing.
+
+It is labelled **SIMULATED CALL** on screen for as long as it is running.
+There is no telephony: nothing is dialled, no number is called, no carrier or
+VoIP service is involved. The microphone is the laptop's and the audio comes
+out of the laptop's speakers.
+
+**Why the answer is quick**
+
+```
+  you start speaking
+        │
+        │  every ~2s, while you are still talking
+        ├──────────────> POST /api/partial
+        │                Guardian scores the fragment on rules alone.
+        │                It may take over mid-sentence.
+        │
+  you finish the sentence
+        │
+        └──────────────> POST /api/message  { live: true }
+                         the decoy answers, and the reply is spoken
+```
+
+The partials are the whole trick. Detection does not wait for anyone to stop
+talking, so by the time a sentence lands the Guardian has usually already moved
+the session to `DECOY_ACTIVE` and the finished sentence costs one decoy call and
+nothing else.
+
+A spoken turn also drops the two things that cost the most wall-clock time and
+make no sense in a call:
+
+| | typed turn | spoken turn (`live: true`) |
+|---|---|---|
+| decoy's typing delay | 1–3s | **0** — nobody types during a phone call |
+| script-stage tagging | rules, then one LLM call | **rules only** — the same text has been through the rules every 2s already |
+| Guardian classifier | one LLM call, capped at 1.1s | unchanged on the finished sentence; **skipped** on partials |
+
+Measured against a stubbed model at 900ms per call, on the digital-arrest
+opening line:
+
+```
+partial (46 chars)            133ms   score=15  MONITORING
+partial (95 chars)             43ms   score=40  SUSPICIOUS
+partial (160 chars)            12ms   score=85  DECOY_ACTIVE   <- takeover, mid-sentence
+final sentence, live: true   1862ms   decoy answered, typingDelay=0
+same sentence, typed          4508ms
+```
+
+So the spoken answer arrives in about 1.9s with a 900ms model, and the live
+flag is worth ~2.6s of that. The round trip is measured in the console and
+printed next to the reply, so a judge reads the real number rather than this
+one.
+
+**What a partial is allowed to do**
+
+A partial is a half-finished sentence. It is scored and thrown away: no message
+is recorded, no entity is stored, no reply is produced, and `lastSeenAt` does
+not move, so silence between partials is never counted as engagement time. The
+transcript in the evidence report holds sentences, not the recogniser's
+working-out.
+
+The Guardian's decision on a partial is deliberately weaker, and one-way:
+
+- the classifier is not called — one model call per two seconds of speech, to
+  judge an unfinished sentence, is not worth it;
+- the state may be **raised** and never lowered or released. Half a sentence is
+  enough to act on a threat and never enough to decide a caller is honest after
+  all. It also stops the user's screen flickering between warnings inside a
+  single breath;
+- the stored classifier verdict is left as the last finished sentence set it, so
+  the report quotes a real label rather than `unavailable`;
+- nothing is written to the decision log unless the state actually moved, and
+  what is written is marked `partial: true` with no `messageId` — because the
+  text it was taken on is not in the transcript.
+
+Everything else applies exactly as it does to a finished message: the
+hard-signal gate, the trusted-contact veto, and the terminal states. A partial
+cannot bait a real caller on three soft signals any more than a typed message
+can.
+
+**Speech in, speech out**
+
+Both sit behind an adapter in `src/public/voice.js`, which is the only file that
+knows a browser is doing either:
+
+```
+Recognizer   available  listening  lang
+             start()  stop()  abort()
+             onpartial(text)  onfinal(text)  onstatus(state, note)
+
+Speaker      available  speaking
+             speak(text, { lang })  cancel()  voiceFor(lang)
+```
+
+One engine is registered, `browser`. A server-side pair — Whisper for the
+recogniser, a hosted voice for the speaker — would be registered next to it and
+selected by name, with nothing in `app.js` changing. None is written yet, by
+design; `app.js` is tested for not reaching past the adapter.
+
+Worth knowing: Chrome's recogniser is **not local**. It streams microphone audio
+to Google's speech service and streams text back. That is a good reason for the
+adapter to exist, and it is said on screen.
+
+The reply is spoken with `speechSynthesis` in the language the *decoy* chose,
+not the language the microphone was set to — the decoy mirrors the caller's
+script, so a Hindi sentence gets a Hindi answer whichever option is selected. It
+looks for a female Indian voice among whatever the platform ships, prefers the
+exact language, falls back to another Indian voice, and says which one it found
+(or that it is using the platform default). The rate is 0.88: the persona is an
+unhurried woman in her seventies, and a scammer is listening for exactly that.
+
+No voice of any real person is sampled, modelled or reproduced. The only voices
+used are the synthetic ones the operating system or browser already ships.
+
+**Barge-in, and the echo problem**
+
+When the scammer starts talking, the decoy stops. That is decided from the
+transcript rather than from the recogniser's `speechstart` event, for a
+practical reason: on a laptop with no headphones the microphone hears the
+decoy's own voice, and `speechstart` cannot tell the two apart — it would cut
+her off the instant she opened her mouth. The text can. If most of what was
+heard is already in the line being spoken, it is the echo and she keeps talking;
+anything else stops her immediately.
+
+Headphones make this a non-issue, and there is a **Mute decoy** tick for a room
+where they are not available: the reply still appears on screen, it just is not
+spoken. `Escape` silences her without ending the call.
+
+**The live transcript**
+
+It appears on all three panes: as a dashed bubble on the phone (dashed because
+it is not in the transcript yet), as your own words coming back in the scammer
+console, and next to the partial score in the intelligence panel. A
+`?view=intel` second screen gets it over Socket.IO as `call.transcript`, at the
+partial cadence, since that is when the text reaches the server at all.
+
+**Running the demo**
+
+1. Open the console in Chrome and press **Start call**. Chrome asks for the
+   microphone once.
+2. Pick a language: English (India), Hindi or Marathi.
+3. Speak as the caller — *"Madam, this is Inspector Deshmukh from CBI Pune, a
+   parcel in your name was seized with narcotics, share the OTP immediately"* —
+   and watch the score climb on the partials and the state flip to
+   `DECOY_ACTIVE` before the sentence is finished.
+4. Stop talking. The decoy answers aloud, and the round trip is printed next to
+   her reply.
+5. Talk over her to see the barge-in.
+
 ---
 
 ## API
@@ -627,6 +797,34 @@ show *why* nothing happened, and `alerts` carries what the protected user and a
 family contact are shown — bilingual, and the family one always marked
 `simulated: true`, because nothing is actually delivered to anyone.
 
+### `POST /api/partial`
+
+A partial transcript from [Call mode](#call-mode--a-simulated-voice-call),
+scored by the Guardian and never recorded.
+
+```json
+{
+  "sessionId": "demo-m1x2",
+  "text": "Madam this is Inspector Deshmukh from CBI Pune, share the OTP",
+  "metadata": { "channel": "Call", "locale": "IN", "from": "+919812345678" }
+}
+```
+
+The response is the Guardian's reading of the fragment — `state`, the same
+`guardian` block as `/api/message`, `alerts`, `takeoverNotice` — plus
+`entitiesThisPartial`, which are read from the fragment and *not* stored. There
+is no `reply`: the decoy answers finished sentences only.
+
+A session is created if it does not exist, and the state the Guardian decides is
+written, so the finished sentence arrives at a session that is already engaged.
+Nothing else is: no message, no entity, and `lastSeenAt` does not move. What a
+partial may and may not do is spelled out under
+[Call mode](#call-mode--a-simulated-voice-call).
+
+`POST /api/message` accepts `"live": true` for the finished sentence. That drops
+the decoy's typing delay and the stage tagger's model call, and is reported back
+as `live` on the turn.
+
 ### Other routes
 
 | Route | Purpose |
@@ -634,6 +832,7 @@ family contact are shown — bilingual, and the family one always marked
 | `GET /health` | no key required; reports whether an LLM, a database and a realtime transport are wired up |
 | `GET /api/sessions` | the 50 most recent sessions |
 | `GET /api/sessions/:sessionId` | one session in full: transcript, entities, score breakdown, stage tags |
+| `POST /api/partial` | a partial transcript from Call mode; scored by the Guardian, never recorded |
 | `POST /api/sessions/:sessionId/genuine` | the "This is genuine" button; ends the engagement, returns the neutral line |
 | `POST /api/sessions/:sessionId/end` | end an engagement explicitly |
 | `GET /api/trusted-contacts` | the protected user's trusted contacts |
@@ -707,11 +906,17 @@ src/
   middleware/auth.js          API key check, fails closed
   models/Session.js           session document and its measured metrics
   routes/api.js               HTTP surface
-  public/                     placeholder page; the console lands here
+  public/
+    index.html                the three-pane demo console
+    app.js                    the console; fetch + Socket.IO, no build step
+    voice.js                  speech in and out, behind an adapter (Call mode)
+    styles.css
 test/                         node:test suite, no test framework to install
   scam-lines.test.js          15 realistic Indian scam lines, the extraction bed
   guardian-matrix.test.js     20 scam + 20 legitimate, prints the confusion matrix
   decoy-runs.test.js          three 13-turn conversations against a scripted scammer
+  console.test.js             the console's ids, panes and honesty labels
+  voice.test.js               the partial-transcript path, the speech adapter, Call mode
   fixtures/messages.js        that corpus, shared with any offline tooling
 docs/legacy/                  diagrams from the original project, unreferenced
 ```
@@ -866,6 +1071,12 @@ enforce that:
   like one is replaced before it is sent
 - she never tells the scammer she is software, but the protected user and the
   dashboard always know — the deception runs one way only
-
-A fuller ethics note, and the false-positive handling shown in the demo, land
-with the operator console.
+- Call mode is a **simulated** call and is labelled as one on screen for as long
+  as it runs. There is no telephony: nothing is dialled, no number is called,
+  and no carrier or VoIP service is involved
+- her voice is a synthetic one the operating system already ships. No voice of
+  any real person is sampled, modelled or reproduced, and nothing in the project
+  does voice conversion or cloning
+- Chrome's speech recogniser streams microphone audio to Google's speech
+  service. That is said on screen rather than left for someone to discover, and
+  it is why speech sits behind an adapter that a local engine can replace

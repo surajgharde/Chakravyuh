@@ -36,6 +36,22 @@
  *   - The user can end an engagement at any moment.
  *   - The Guardian keeps scoring while engaged and releases on its own if the
  *     conversation turns out to be legitimate.
+ *
+ * PARTIAL TRANSCRIPTS
+ *
+ * In a voice call, speech recognition hands over a partial transcript every
+ * couple of seconds while the caller is still mid-sentence. `partial: true`
+ * scores one of those. It is deliberately a weaker, one-way decision:
+ *
+ *   - the classifier is not called, so the rules decide alone;
+ *   - the state may be raised and may never be lowered or released;
+ *   - the stored classifier verdict is left as the last finished sentence set it;
+ *   - nothing is logged unless the state actually moved.
+ *
+ * Everything else - the hard-signal gate, the trusted-contact veto, the
+ * terminal states - applies exactly as it does to a finished message. A partial
+ * can start an engagement, which is the point: by the time the caller has
+ * finished the sentence, the decoy is already allowed to answer.
  */
 
 const logger = require('../services/logger');
@@ -595,6 +611,8 @@ const buildAlerts = ({ state, trusted, looksLikeScam, score }) => {
  * @param {string} params.from          the caller's number or handle
  * @param {string} params.userId        the protected user
  * @param {string} params.messageId     the message being scored, for the log
+ * @param {boolean} params.partial      true for a half-finished sentence during
+ *                                      a voice call; see PARTIAL TRANSCRIPTS
  */
 const handleMessage = async ({
     session,
@@ -609,6 +627,7 @@ const handleMessage = async ({
     from = null,
     userId = trustedContacts.DEFAULT_USER_ID,
     messageId = null,
+    partial = false,
 }) => {
     const startedAt = Date.now();
     const thresholds = { ...DEFAULT_THRESHOLDS, ...thresholdOverrides };
@@ -635,9 +654,17 @@ const handleMessage = async ({
 
     // 2. Classifier. It judges the newest message, which is what the user is
     // reading right now. Bounded so the whole decision fits the budget.
+    //
+    // Skipped on a partial. A partial arrives every two seconds while someone
+    // is still talking, so a model call per partial would cost more than the
+    // whole rest of the call and would be judging a sentence that is not
+    // finished. The rules carry the partial path on their own, and the
+    // classifier runs on the finished sentence a moment later.
     const elapsed = Date.now() - startedAt;
     const classifierBudget = Math.max(200, Math.min(CLASSIFIER_BUDGET_MS, DECISION_BUDGET_MS - elapsed - 100));
-    const classifier = await classify(llm, text, { budgetMs: classifierBudget });
+    const classifier = partial
+        ? { label: 'unavailable', reasons: [], available: false, note: 'Partial transcript; rules only.' }
+        : await classify(llm, text, { budgetMs: classifierBudget });
 
     // 3. State.
     const decision = decideState(
@@ -667,26 +694,42 @@ const handleMessage = async ({
     // While engaged, keep scoring, and let go if it turns out to be legitimate.
     let released = false;
     if (previousState === STATES.DECOY_ACTIVE && !TERMINAL_STATES.includes(previousState)) {
-        if (classifier.label === 'legit' && scored.score < thresholds.release) {
+        if (!partial && classifier.label === 'legit' && scored.score < thresholds.release) {
             state = STATES.LEGIT;
             released = true;
             notes.push(`Conversation turned legitimate while engaged (score ${scored.score}); decoy released.`);
-        } else if (state !== STATES.LEGIT) {
+        } else if (state !== STATES.LEGIT || partial) {
             // Once engaged, a quiet turn does not hand the thread back: a
             // scammer who stops pressing for one message has not become honest.
             state = STATES.DECOY_ACTIVE;
         }
     }
 
+    // A partial may raise the state and may never lower it. Half of a sentence
+    // is enough to act on a threat; it is never enough to decide a caller is
+    // honest after all. Releasing on "...madam, actually" and then baiting
+    // again two seconds later would also make the user's screen flicker
+    // between warnings during a single breath.
+    if (partial && rungOf(state) < rungOf(previousState) && !TERMINAL_STATES.includes(previousState)) {
+        state = previousState;
+        notes.push(`Partial transcript scored ${scored.score}; held at ${previousState} `
+            + 'because a partial never lowers the state.');
+    }
+
     const decisionMs = Date.now() - startedAt;
 
-    // Persist.
+    // Persist. A partial writes the state and the rule score, because those are
+    // what let the decoy speak the moment the sentence lands - but it leaves the
+    // classifier verdict alone, so the report still quotes the label that was
+    // reached on a finished sentence rather than "unavailable".
     session.guardianState = state;
     session.score = scored.score;
     session.scoreBreakdown = scored.breakdown;
     session.firedSignals = scored.fired;
-    session.classifierLabel = classifier.label;
-    session.classifierReasons = classifier.reasons;
+    if (!partial) {
+        session.classifierLabel = classifier.label;
+        session.classifierReasons = classifier.reasons;
+    }
     if (identifier) session.counterpartId = identifier;
     session.userId = userId;
 
@@ -695,10 +738,15 @@ const handleMessage = async ({
     // Every decision is logged, not just the latest one. A cybercrime unit
     // reading the report has to be able to see when the system decided to
     // engage and on what basis.
-    if (Array.isArray(session.guardianLog)) {
+    //
+    // A partial is logged only when it moved the state. Every two seconds of
+    // speech otherwise produces a log line about a sentence that is not in the
+    // transcript, which buries the decisions that matter.
+    if (Array.isArray(session.guardianLog) && (!partial || changed)) {
         session.guardianLog.push({
             at: new Date(),
             messageId,
+            partial,
             score: scored.score,
             state,
             previousState,
@@ -723,7 +771,12 @@ const handleMessage = async ({
     const alerts = buildAlerts({ state, trusted, looksLikeScam, score: scored.score });
 
     // Events.
-    const base = { sessionId: session.sessionId, state, score: scored.score, at: new Date().toISOString() };
+    // `partial` rides along on every event so a console can show a score that
+    // came from a half-spoken sentence as exactly that.
+    const base = {
+        sessionId: session.sessionId, state, score: scored.score, partial,
+        at: new Date().toISOString(),
+    };
 
     emit(EVENTS.SCORE, {
         ...base,
@@ -778,6 +831,7 @@ const handleMessage = async ({
         notes,
         thresholds,
         decisionMs,
+        partial,
         takeoverNotice: state === STATES.DECOY_ACTIVE ? TAKEOVER_NOTICE : null,
     };
 };

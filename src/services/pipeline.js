@@ -9,6 +9,13 @@
  * caller from ever being baited.
  *
  * Every counter and duration written here is measured. Nothing is padded.
+ *
+ * handlePartial() is the voice-call seam. During a simulated call, speech
+ * recognition hands over a partial transcript every couple of seconds while
+ * the caller is still talking. Those run the Guardian and nothing else: no
+ * message is recorded, no entity is stored, no decoy reply is produced. The
+ * sentence becomes a message only when recognition marks it final and it
+ * arrives through handleTurn() like any other.
  */
 
 const Session = require('../models/Session');
@@ -113,6 +120,13 @@ const handleTurn = async (body, deps = {}) => {
     const userId = (metadata.userId || body?.userId || trustedContacts.DEFAULT_USER_ID).toString();
     const from = callerIdFrom(metadata, body?.message);
 
+    // A spoken turn. The caller is waiting on the line rather than reading a
+    // chat, so the two things that cost the most wall-clock time come out:
+    // the decoy's typing delay (nobody types in a call) and the stage
+    // tagger's model call. The stage rules still run, and the same text has
+    // been through the rules every two seconds already as a partial.
+    const live = body?.live === true || metadata.live === true;
+
     const { session, created } = await loadOrCreate({ sessionId, history, metadata, receivedAt, userId });
 
     // A returning session may carry metadata it did not have on the first turn.
@@ -162,7 +176,9 @@ const handleTurn = async (body, deps = {}) => {
     const merged = extractor.mergeInto(session, entities);
 
     // Script stages for this message: rules, then one LLM call for the rest.
-    const messageStages = isIncomingFromCounterpart ? await stages.tag(incoming.text, { llm }) : [];
+    const messageStages = isIncomingFromCounterpart
+        ? await stages.tag(incoming.text, { llm, useLlm: !live })
+        : [];
     session.messages[session.messages.length - 1].stages = messageStages;
     refreshScriptStages(session);
 
@@ -215,7 +231,7 @@ const handleTurn = async (body, deps = {}) => {
             history: session.messages.slice(0, -1),
             incomingText: incoming.text,
             llm,
-            config,
+            config: { ...config, live },
             personaId: session.personaId || 'default',
         });
 
@@ -252,6 +268,8 @@ const handleTurn = async (body, deps = {}) => {
 
     const result = {
         sessionId,
+        // True when this turn came off a microphone rather than a keyboard.
+        live,
         // What the counterpart receives. Null unless the decoy is engaged.
         reply: decoyResult ? decoyResult.reply : null,
         state: session.guardianState,
@@ -327,6 +345,135 @@ const handleTurn = async (body, deps = {}) => {
 };
 
 /**
+ * Scores a partial transcript from a simulated voice call.
+ *
+ * Speech recognition hands one of these over roughly every two seconds while
+ * the caller is still mid-sentence. The point is that detection does not have
+ * to wait for them to stop talking: by the time the sentence lands, the
+ * Guardian has usually already decided, so the decoy can answer at once.
+ *
+ * What this deliberately does NOT do:
+ *
+ *   - record a message. The text is not final and would pollute the transcript
+ *     and the evidence report with half-sentences.
+ *   - store entities. The same account number would otherwise be filed with
+ *     the provenance of a fragment, and `occurrences` would count the number
+ *     of times the recogniser revised its guess rather than the number of
+ *     times it was said.
+ *   - produce a decoy reply. The decoy answers finished sentences only.
+ *   - move firstSeenAt or lastSeenAt on a session that already exists. Those
+ *     are message receive times, and letting partials push lastSeenAt forward
+ *     would inflate the engagement duration with silence. (A session that a
+ *     partial creates does get its firstSeenAt from that moment, which is
+ *     when the call really started.)
+ *
+ * It DOES write the Guardian's state, because that is the whole point: the
+ * hand-off has to be in place before the sentence arrives.
+ *
+ * @param {object} body   { sessionId, text, metadata }
+ * @param {object} deps   { llm, config, events }
+ * @returns {Promise<object>} the Guardian's reading of the partial
+ */
+const handlePartial = async (body, deps = {}) => {
+    const { config = {}, events = null } = deps;
+    const receivedAt = new Date();
+
+    const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+    if (!sessionId) throw new PipelineError('sessionId is required.');
+
+    const text = typeof body?.text === 'string' ? body.text.trim() : '';
+    if (text === '') throw new PipelineError('text is required.');
+
+    const metadata = body?.metadata && typeof body.metadata === 'object' ? body.metadata : {};
+    const userId = (metadata.userId || body?.userId || trustedContacts.DEFAULT_USER_ID).toString();
+    const from = callerIdFrom(metadata, null);
+
+    const { session, created } = await loadOrCreate({
+        sessionId, history: [], metadata, receivedAt, userId,
+    });
+
+    if (metadata.channel) session.channel = metadata.channel;
+    if (metadata.language) session.language = metadata.language;
+    if (metadata.locale) session.locale = metadata.locale;
+
+    // Entities from the fragment are passed to the scorer and thrown away. The
+    // Guardian needs them to fire the payment-rail and link signals; the
+    // session does not want them until the sentence is finished.
+    const entities = extractor.extractEntities(text, { sessionId, messageId: null, timestamp: receivedAt });
+
+    // Stage tags, rules only. No model call: this runs every two seconds.
+    // They are read, not stored, for the same reason as the entities.
+    const partialStages = stages.tagWithRules(text);
+    const seenStages = new Set([...(session.scriptStages || []), ...partialStages.map((t) => t.stage)]);
+    const scriptStages = stages.STAGES.filter((stage) => seenStages.has(stage));
+
+    const priorTexts = session.messages.filter((m) => m.role === 'scammer').map((m) => m.text);
+
+    const verdict = await guardian.handleMessage({
+        session,
+        text,
+        entities,
+        allEntities: [...session.entities, ...entities],
+        priorTexts,
+        scriptStages,
+        // No classifier on a partial, so no transport is needed either.
+        llm: null,
+        events,
+        thresholds: config.guardianThresholds || {},
+        from,
+        userId,
+        messageId: null,
+        partial: true,
+    });
+
+    // A session created by a partial has no messages in it yet. Saving it keeps
+    // the state the Guardian just decided, so the finished sentence arrives at
+    // a session that is already engaged.
+    await session.save();
+
+    if (events) {
+        events.emit(EVENTS.TRANSCRIPT, {
+            sessionId,
+            text,
+            final: false,
+            state: verdict.state,
+            score: verdict.score,
+            at: receivedAt.toISOString(),
+        });
+    }
+
+    return {
+        sessionId,
+        partial: true,
+        createdSession: created,
+        state: verdict.state,
+        guardian: {
+            state: verdict.state,
+            previousState: verdict.previousState,
+            changed: verdict.changed,
+            takeover: verdict.engagedNow,
+            score: verdict.score,
+            rawScore: verdict.rawScore,
+            breakdown: verdict.breakdown,
+            firedSignals: verdict.firedSignals,
+            hardSignals: verdict.hardSignals,
+            ruleState: verdict.ruleState,
+            classifier: verdict.classifier,
+            thresholds: verdict.thresholds,
+            notes: verdict.notes,
+            decisionMs: verdict.decisionMs,
+            trustedContact: verdict.trustedContact,
+        },
+        alerts: verdict.alerts,
+        takeoverNotice: verdict.takeoverNotice,
+        scriptStages: { thisPartial: partialStages, session: scriptStages },
+        // Read from the fragment and not stored. Shown so an operator can watch
+        // identifiers surface as they are spoken.
+        entitiesThisPartial: entities,
+    };
+};
+
+/**
  * The protected user pressed "This is genuine".
  *
  * Ends the engagement immediately, returns the one neutral line to send so the
@@ -364,4 +511,6 @@ const markGenuine = async (sessionId, deps = {}) => {
     };
 };
 
-module.exports = { handleTurn, markGenuine, PipelineError, loadOrCreate, refreshScriptStages };
+module.exports = {
+    handleTurn, handlePartial, markGenuine, PipelineError, loadOrCreate, refreshScriptStages,
+};

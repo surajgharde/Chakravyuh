@@ -54,6 +54,10 @@
   </div>
 
   <div class="ml-auto flex items-center gap-2">
+    <span id="call-badge"
+          class="hidden text-[11px] font-semibold px-2 py-1 rounded border border-brick text-brick bg-brick/5">
+      &#9679; SIMULATED CALL &mdash; laptop mic, no telephony
+    </span>
     <span id="llm-badge" class="hidden text-[11px] px-2 py-1 rounded border border-amber text-amber bg-amber/5"></span>
     <span id="demo-badge" class="hidden text-[11px] px-2 py-1 rounded border border-line text-muted">DEMO_MODE</span>
 
@@ -102,6 +106,14 @@
       <!-- chat -->
       <div id="phone-chat" class="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0"></div>
 
+      <!-- what the caller is saying right now, before the sentence is finished -->
+      <div id="phone-live-wrap" class="hidden px-3 pb-2">
+        <div class="bubble bubble-them bubble-live">
+          <span id="phone-live" class="italic"></span><span class="caret">&#9611;</span>
+        </div>
+        <div class="bubble-meta">caller speaking &middot; not yet in the transcript</div>
+      </div>
+
       <!-- status + the genuine button -->
       <div class="px-3 py-2 border-t border-line bg-white/70 space-y-2">
         <div>
@@ -124,6 +136,44 @@
     <h2 class="pane-title">Scammer console <span class="text-muted font-normal normal-case tracking-normal">— you type here</span></h2>
 
     <div class="flex-1 flex flex-col min-h-0 bg-white border border-line rounded-lg overflow-hidden">
+
+      <!-- call mode -->
+      <div class="p-2.5 border-b border-line bg-brick/[0.03]">
+        <div class="flex items-center gap-2">
+          <span class="text-[10px] uppercase tracking-wider text-muted font-semibold">Call mode</span>
+          <span class="text-[10px] text-muted">&mdash; simulated call, your laptop mic</span>
+          <span id="call-timer" class="ml-auto font-mono text-[11px] tabular-nums text-muted">00:00</span>
+        </div>
+
+        <div class="mt-1.5 flex items-center gap-1.5">
+          <button type="button" id="btn-call"
+                  class="text-[12px] font-semibold px-3 py-1.5 rounded border border-brick text-brick
+                         hover:bg-brick hover:text-white disabled:opacity-40 disabled:hover:bg-transparent
+                         disabled:hover:text-brick transition-colors">
+            Start call
+          </button>
+
+          <select id="call-lang"
+                  class="text-[11px] border border-line rounded px-1.5 py-1.5 bg-white"></select>
+
+          <label class="flex items-center gap-1 text-[10px] text-muted cursor-pointer select-none"
+                 title="Keep the reply on screen only. Use this when the laptop has no headphones and the mic keeps hearing the decoy.">
+            <input type="checkbox" id="call-mute" class="accent-brick">
+            <span>Mute decoy</span>
+          </label>
+        </div>
+
+        <div id="call-status" class="mt-1.5 text-[10.5px] text-muted leading-snug">
+          Not in a call. Call mode needs Chrome.
+        </div>
+
+        <!-- the live transcript, as the scammer's own words come back -->
+        <div id="call-live-wrap" class="hidden mt-1.5 border border-line rounded bg-white px-2 py-1.5">
+          <div class="text-[9.5px] uppercase tracking-wider text-muted font-semibold">You are saying</div>
+          <div id="call-live" class="text-[11.5px] leading-snug mt-0.5 min-h-[1.2em]"></div>
+          <div id="call-partials" class="text-[9.5px] text-muted mt-1"></div>
+        </div>
+      </div>
 
       <!-- scenarios -->
       <div class="p-2.5 border-b border-line">
@@ -221,6 +271,18 @@
       <!-- scrolling body -->
       <div class="flex-1 overflow-y-auto min-h-0">
 
+        <!-- the live call: transcript and what the partials are scoring -->
+        <div id="intel-live-wrap" class="hidden p-2.5 border-b border-line bg-brick/[0.03]">
+          <div class="flex items-baseline justify-between mb-1">
+            <span class="text-[10px] uppercase tracking-wider text-brick font-semibold">
+              Live transcript &mdash; simulated call
+            </span>
+            <span id="intel-live-meta" class="text-[10px] text-muted"></span>
+          </div>
+          <div id="intel-live" class="text-[11px] leading-snug italic text-muted min-h-[1.2em]"></div>
+          <div id="intel-live-note" class="text-[9.5px] text-muted mt-1 leading-snug"></div>
+        </div>
+
         <!-- identifiers -->
         <div class="p-2.5 border-b border-line">
           <div class="flex items-baseline justify-between mb-1.5">
@@ -312,6 +374,7 @@
 <!-- ===================== toasts ===================== -->
 <div id="toasts" class="fixed bottom-4 right-4 z-50 space-y-2 w-80"></div>
 
+<script src="voice.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

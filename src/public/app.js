@@ -7,6 +7,10 @@
  * Two screens: open the page normally for the operator view, and
  * `?view=intel` on a second screen for the intelligence panel on its own.
  * Both stay live off the same socket events.
+ *
+ * Call mode, down at the bottom, is the same pipeline driven by a microphone
+ * instead of the composer. Speech and speech synthesis both come from
+ * voice.js, which is the only file that knows the browser is doing either.
  */
 
 (() => {
@@ -40,6 +44,7 @@
         connLabel: $('conn-label'),
         llmBadge: $('llm-badge'),
         demoBadge: $('demo-badge'),
+        callBadge: $('call-badge'),
         judgeMode: $('judge-mode'),
         btnReset: $('btn-reset'),
 
@@ -51,6 +56,8 @@
         takeoverMr: $('takeover-mr'),
         phoneAlerts: $('phone-alerts'),
         phoneChat: $('phone-chat'),
+        phoneLiveWrap: $('phone-live-wrap'),
+        phoneLive: $('phone-live'),
         statusEn: $('status-en'),
         statusMr: $('status-mr'),
         btnGenuine: $('btn-genuine'),
@@ -65,6 +72,15 @@
         btnSend: $('btn-send'),
         btnNext: $('btn-next'),
         sendState: $('send-state'),
+
+        btnCall: $('btn-call'),
+        callLang: $('call-lang'),
+        callMute: $('call-mute'),
+        callStatus: $('call-status'),
+        callTimer: $('call-timer'),
+        callLiveWrap: $('call-live-wrap'),
+        callLive: $('call-live'),
+        callPartials: $('call-partials'),
 
         stateBadge: $('state-badge'),
         scoreBar: $('score-bar'),
@@ -82,6 +98,10 @@
         decoySource: $('decoy-source'),
         decoyFlags: $('decoy-flags'),
         decisions: $('decisions'),
+        intelLiveWrap: $('intel-live-wrap'),
+        intelLive: $('intel-live'),
+        intelLiveMeta: $('intel-live-meta'),
+        intelLiveNote: $('intel-live-note'),
         thDecoy: $('th-decoy'),
         thSusp: $('th-susp'),
 
@@ -457,6 +477,13 @@
      * never advanced by anything other than the clock.
      */
     const tick = () => {
+        // How long the call has been open. Separate from the engagement clock:
+        // a call can be live for a minute before anything scores high enough
+        // to count as an engagement.
+        if (call.active && call.startedAt) {
+            el.callTimer.textContent = mmss((Date.now() - call.startedAt) / 1000);
+        }
+
         if (!state.firstSeenAt) return;
         const end = state.finished && state.lastSeenAt ? state.lastSeenAt : Date.now();
         const seconds = (end - state.firstSeenAt) / 1000;
@@ -545,28 +572,43 @@
     // Sending
     // ---------------------------------------------------------------------
 
-    const send = async (text) => {
+    /**
+     * Sends one scammer message and applies the turn.
+     *
+     * `live` marks a turn that came off the microphone. It travels to the
+     * server, where it drops the decoy's typing delay and the stage tagger's
+     * model call - neither of which belongs in a spoken call, and together
+     * they are most of the gap between the caller finishing a sentence and
+     * hearing an answer.
+     *
+     * Returns the turn, so Call mode can speak the reply and measure how long
+     * the whole round trip took.
+     */
+    const send = async (text, { live = false } = {}) => {
         const body = text.trim();
-        if (body === '') return;
+        if (body === '') return null;
 
         el.btnSend.disabled = true;
-        el.sendState.textContent = 'sending...';
+        el.sendState.textContent = live ? 'heard, thinking...' : 'sending...';
 
         const sentAt = Date.now();
         if (!state.firstSeenAt) state.firstSeenAt = sentAt;
 
-        addPhoneBubble(body, 'them', `${el.channel.value} · ${el.from.value}`);
+        addPhoneBubble(body, 'them', live
+            ? `spoken · ${el.from.value}`
+            : `${el.channel.value} · ${el.from.value}`);
         el.phoneCaller.textContent = el.from.value || 'Unknown number';
-        el.phoneChannel.textContent = el.channel.value;
+        el.phoneChannel.textContent = live ? 'Call (simulated, live mic)' : el.channel.value;
 
         try {
             const response = await api('/api/message', {
                 method: 'POST',
                 body: JSON.stringify({
                     sessionId: state.sessionId,
+                    live,
                     message: { sender: 'scammer', text: body, timestamp: sentAt },
                     metadata: {
-                        channel: el.channel.value,
+                        channel: live ? 'Call' : el.channel.value,
                         language: (state.scenario && state.scenario.language) || 'English',
                         locale: 'IN',
                         from: el.from.value,
@@ -576,21 +618,27 @@
             });
 
             const turn = await response.json();
+            turn.roundTripMs = Date.now() - sentAt;
+
             applyTurn(turn);
             addScammerLogEntry(body, turn);
 
             if (turn.reply) {
-                addPhoneBubble(turn.reply, 'us', `Guardian replied as Sudha · ${turn.decoy.language}`);
+                addPhoneBubble(turn.reply, 'us', live
+                    ? `Guardian answered as Sudha · ${turn.decoy.language} · ${(turn.roundTripMs / 1000).toFixed(1)}s`
+                    : `Guardian replied as Sudha · ${turn.decoy.language}`);
             }
 
             el.message.value = '';
             el.sendState.textContent = '';
+            return turn;
         } catch (error) {
             toast(`Send failed: ${error.message}`, 'bad');
             el.sendState.textContent = 'failed';
+            return null;
         } finally {
             el.btnSend.disabled = false;
-            el.message.focus();
+            if (!live) el.message.focus();
         }
     };
 
@@ -770,10 +818,362 @@
     };
 
     // ---------------------------------------------------------------------
+    // Call mode
+    // ---------------------------------------------------------------------
+
+    /**
+     * A simulated call. The microphone replaces the composer; nothing else
+     * about the pipeline changes.
+     *
+     * HOW A TURN RUNS
+     *
+     *   speech --(every ~2s, while still talking)--> POST /api/partial
+     *                                                Guardian scores, may take over
+     *   recogniser commits the sentence -----------> POST /api/message (live: true)
+     *                                                the decoy answers
+     *   reply -------------------------------------> speechSynthesis
+     *
+     * The partials are what make the answer quick. By the time the caller
+     * stops talking the Guardian has usually already moved the session to
+     * DECOY_ACTIVE, so the finished sentence costs one decoy call and nothing
+     * else. The round trip is measured and shown on screen rather than
+     * asserted.
+     *
+     * A partial is scored and thrown away. Only a sentence the recogniser has
+     * committed to becomes a message, so the transcript in the evidence report
+     * holds sentences and not the recogniser's working-out.
+     */
+
+    /** How often a partial goes to the Guardian while someone is still talking. */
+    const PARTIAL_INTERVAL_MS = 2000;
+
+    const voice = window.ChakravyuhVoice || null;
+    const engine = voice ? voice.create('browser') : null;
+
+    const call = {
+        active: false,
+        startedAt: null,
+        // The sentence being spoken right now, as last revised.
+        interim: '',
+        // The last partial actually sent, so an unchanged one is not re-sent.
+        sentText: '',
+        partialsSent: 0,
+        partialTimer: null,
+        // What the decoy is saying, for telling an echo from a real voice.
+        speakingText: '',
+        lastRoundTripMs: null,
+    };
+
+    const callSupported = () => Boolean(engine
+        && engine.recognizer.available
+        && engine.speaker.available);
+
+    const setCallStatus = (text) => {
+        el.callStatus.textContent = text;
+    };
+
+    /**
+     * Paints the live transcript on all three panes.
+     *
+     * The phone shows it as a dashed bubble, because the user is hearing it
+     * and it is not in the transcript yet. The scammer console shows it as
+     * their own words coming back, which is also the only feedback that the
+     * microphone is working at all. The intelligence panel shows it next to
+     * what the partials are scoring.
+     */
+    const renderLive = (text, { score = null, scoreState = null } = {}) => {
+        const empty = String(text || '').trim() === '';
+
+        el.phoneLiveWrap.classList.toggle('hidden', empty);
+        el.phoneLive.textContent = text || '';
+
+        el.callLiveWrap.classList.toggle('hidden', !call.active);
+        el.callLive.textContent = text || '';
+        el.callLive.className = 'text-[11.5px] leading-snug mt-0.5 min-h-[1.2em]'
+            + (empty ? '' : ' interim');
+
+        el.intelLive.textContent = empty ? 'listening...' : text;
+
+        if (score !== null) {
+            el.intelLiveMeta.textContent = 'partial scored ' + score + ' · ' + scoreState;
+        }
+    };
+
+    /** The counter under the live transcript, so the 2s cadence is visible. */
+    const renderPartialCount = (note) => {
+        el.callPartials.textContent = call.partialsSent === 0
+            ? 'The Guardian is scored every ' + (PARTIAL_INTERVAL_MS / 1000) + 's while you speak.'
+            : call.partialsSent + ' partial(s) scored' + (note ? ' · ' + note : '');
+    };
+
+    /**
+     * Applies a partial's verdict.
+     *
+     * Deliberately narrower than applyTurn: a partial carries no reply, no
+     * stored identifiers and no finished transcript, so it only moves the
+     * score, the state and the user-facing warnings. It never enables the
+     * report buttons and never touches the engagement clock.
+     */
+    const applyPartial = (result) => {
+        const verdict = result.guardian;
+
+        renderState(result.state);
+        setStatus(result.state);
+        renderScore(verdict.score, verdict.breakdown, null, verdict.thresholds);
+        renderAlerts(result.alerts);
+        showTakeover(result.takeoverNotice);
+
+        state.engaged = result.state === 'DECOY_ACTIVE';
+        el.btnGenuine.disabled = !state.engaged;
+
+        if (verdict.changed) {
+            addDecision({
+                score: verdict.score,
+                stateChanged: true,
+                from: verdict.previousState,
+                to: verdict.state,
+            });
+        }
+        if (verdict.takeover) {
+            toast('Guardian took over mid-sentence, before the caller had finished speaking.', 'ok', 5000);
+        }
+    };
+
+    /** Sends whatever is currently being said to the Guardian. */
+    const sendPartial = async () => {
+        const text = call.interim.trim();
+        if (!call.active || text === '' || text === call.sentText) return;
+        call.sentText = text;
+
+        try {
+            const result = await (await api('/api/partial', {
+                method: 'POST',
+                body: JSON.stringify({
+                    sessionId: state.sessionId,
+                    text,
+                    metadata: {
+                        channel: 'Call',
+                        locale: 'IN',
+                        from: el.from.value,
+                        userId: state.userId,
+                    },
+                }),
+            })).json();
+
+            call.partialsSent += 1;
+            renderPartialCount('last: ' + result.guardian.score + ' / ' + result.state);
+            renderLive(text, { score: result.guardian.score, scoreState: result.state });
+            applyPartial(result);
+        } catch (error) {
+            // A dropped partial is not worth interrupting a call over. The next
+            // one is two seconds away, and the finished sentence is scored in
+            // full regardless.
+            renderPartialCount('last partial failed: ' + error.message);
+        }
+    };
+
+    /** Speaks the decoy's reply, in whatever language the decoy chose. */
+    const speakReply = async (turn) => {
+        if (!turn || !turn.reply) return;
+
+        if (el.callMute.checked) {
+            setCallStatus('Decoy muted. The reply is on screen only.');
+            return;
+        }
+
+        const language = turn.decoy ? turn.decoy.language : 'English';
+        const lang = voice.tagForDecoyLanguage(language);
+        call.speakingText = turn.reply;
+
+        const chosen = engine.speaker.voiceFor(lang);
+        setCallStatus('Sudha is answering in ' + language
+            + (chosen ? ' (' + chosen.name + ')' : ' (the platform default voice)') + '.');
+
+        await engine.speaker.speak(turn.reply, { lang });
+        call.speakingText = '';
+
+        if (call.active) setCallStatus('Listening. Speak as the caller.');
+    };
+
+    /** A sentence the recogniser has committed to. This is the turn. */
+    const onFinalTranscript = async (text) => {
+        // Whatever was half-said is a whole sentence now, so the live panes go
+        // back to empty until the caller starts the next one.
+        call.interim = '';
+        call.sentText = '';
+        renderLive('');
+
+        const startedAt = Date.now();
+        const turn = await send(text, { live: true });
+        if (!turn) {
+            setCallStatus('That sentence did not go through. Say it again.');
+            return;
+        }
+
+        call.lastRoundTripMs = Date.now() - startedAt;
+        el.intelLiveMeta.textContent = 'last answer in '
+            + (call.lastRoundTripMs / 1000).toFixed(1) + 's';
+        el.intelLiveNote.textContent = turn.reply
+            ? call.partialsSent + ' partial(s) were scored before that sentence finished, '
+                + 'which is why the hand-off was already in place when it landed.'
+            : 'No reply: the Guardian is ' + turn.state
+                + '. A caller who is not being baited hears nothing back.';
+
+        if (!turn.reply) {
+            setCallStatus('Guardian is ' + turn.state + ', so the decoy stayed silent. Keep talking.');
+            return;
+        }
+
+        await speakReply(turn);
+    };
+
+    /**
+     * A revised guess at the sentence in progress.
+     *
+     * Two jobs: repaint the live transcript, and barge in. Barge-in is decided
+     * here rather than on the recogniser's speechstart event, because on a
+     * laptop with no headphones the microphone hears the decoy's own voice and
+     * speechstart cannot tell the two apart. The text can: if most of what was
+     * heard is already in the line being spoken, it is the echo, and the decoy
+     * keeps talking.
+     */
+    const onPartialTranscript = (text) => {
+        if (engine.speaker.speaking && voice.isEcho(text, call.speakingText)) return;
+
+        if (engine.speaker.speaking) {
+            engine.speaker.cancel();
+            call.speakingText = '';
+            setCallStatus('You cut in. Sudha stopped talking.');
+        }
+
+        call.interim = text;
+        renderLive(text);
+    };
+
+    const startCall = () => {
+        if (!callSupported()) {
+            toast('Call mode needs Chrome: no other browser ships the Web Speech recogniser. '
+                + 'The typed console works everywhere.', 'bad', 9000);
+            return;
+        }
+
+        call.active = true;
+        call.startedAt = Date.now();
+        call.interim = '';
+        call.sentText = '';
+        call.partialsSent = 0;
+        call.speakingText = '';
+        call.lastRoundTripMs = null;
+
+        // A call is a call. Say so in the channel the session records.
+        el.channel.value = 'Call';
+        el.phoneChannel.textContent = 'Call (simulated, live mic)';
+
+        engine.recognizer.lang = el.callLang.value;
+        engine.recognizer.start();
+
+        el.btnCall.textContent = 'End call';
+        el.callBadge.classList.remove('hidden');
+        el.callLiveWrap.classList.remove('hidden');
+        el.intelLiveWrap.classList.remove('hidden');
+        el.intelLiveNote.textContent = '';
+        renderLive('');
+        renderPartialCount();
+
+        call.partialTimer = setInterval(sendPartial, PARTIAL_INTERVAL_MS);
+    };
+
+    const endCall = () => {
+        call.active = false;
+        if (call.partialTimer) clearInterval(call.partialTimer);
+        call.partialTimer = null;
+
+        if (engine) {
+            engine.recognizer.abort();
+            engine.speaker.cancel();
+        }
+        call.speakingText = '';
+
+        el.btnCall.textContent = 'Start call';
+        el.callBadge.classList.add('hidden');
+        el.callLiveWrap.classList.add('hidden');
+        el.phoneLiveWrap.classList.add('hidden');
+        el.intelLive.textContent = 'Call ended.';
+        setCallStatus('Call ended. ' + call.partialsSent
+            + ' partial(s) were scored while you were speaking.');
+    };
+
+    /**
+     * Wires Call mode up once, at load. The handlers test `call.active`
+     * themselves, so there is nothing to bind and unbind per call.
+     */
+    const wireCallMode = () => {
+        for (const language of (voice ? voice.LANGUAGES : [])) {
+            const option = document.createElement('option');
+            option.value = language.tag;
+            option.textContent = language.label;
+            el.callLang.append(option);
+        }
+
+        if (!callSupported()) {
+            el.btnCall.disabled = true;
+            el.callLang.disabled = true;
+            setCallStatus('Call mode needs Chrome. This browser has no Web Speech recogniser, so '
+                + 'the microphone cannot be used. Everything else on this page works.');
+            return;
+        }
+
+        setCallStatus('Not in a call. Press Start call and speak as the caller.');
+        renderPartialCount();
+
+        engine.recognizer.onpartial = (text) => {
+            if (call.active) onPartialTranscript(text);
+        };
+
+        engine.recognizer.onfinal = (text) => {
+            if (call.active) onFinalTranscript(text);
+        };
+
+        engine.recognizer.onstatus = (status, note) => {
+            if (status === 'error') {
+                setCallStatus(note);
+                toast(note, 'bad', 8000);
+                if (/permission/i.test(note)) endCall();
+                return;
+            }
+            if (!call.active) return;
+            setCallStatus(status === 'listening'
+                ? 'Listening. Speak as the caller.'
+                : 'Microphone idle; picking it back up.');
+        };
+
+        el.btnCall.addEventListener('click', () => (call.active ? endCall() : startCall()));
+
+        el.callLang.addEventListener('change', () => {
+            engine.recognizer.lang = el.callLang.value;
+            if (!call.active) return;
+            // The language is fixed when the recogniser starts, so changing it
+            // mid-call means restarting it.
+            engine.recognizer.abort();
+            engine.recognizer.start();
+            setCallStatus('Listening in '
+                + el.callLang.options[el.callLang.selectedIndex].text + '.');
+        });
+
+        el.callMute.addEventListener('change', () => {
+            if (el.callMute.checked) engine.speaker.cancel();
+        });
+    };
+
+    // ---------------------------------------------------------------------
     // Reset
     // ---------------------------------------------------------------------
 
     const reset = async () => {
+        // A live call belongs to the session it started in. Carrying the
+        // microphone over to a new one would put half a conversation in each.
+        if (call.active) endCall();
+
         if (state.sessionId) {
             try {
                 await api(`/api/sessions/${state.sessionId}/reset`, { method: 'POST' });
@@ -797,6 +1197,11 @@
         el.phoneChannel.textContent = '—';
         el.phoneClock.textContent = '00:00';
         el.wasted.textContent = '00:00';
+        el.callTimer.textContent = '00:00';
+        el.intelLiveWrap.classList.add('hidden');
+        el.intelLiveMeta.textContent = '';
+        el.intelLiveNote.textContent = '';
+        renderPartialCount();
 
         showTakeover(null);
         renderState('MONITORING');
@@ -865,9 +1270,36 @@
          * without this it would see scores move but never learn what was
          * extracted.
          */
+        /**
+         * The live transcript of a simulated call.
+         *
+         * The window holding the microphone has already painted this from the
+         * recogniser; this is for every other window - the `?view=intel`
+         * second screen, which never hears anything itself. It arrives at the
+         * partial cadence rather than continuously, because that is when the
+         * text reaches the server at all.
+         */
+        socket.on('call.transcript', (payload) => {
+            if (payload.sessionId !== state.sessionId) return;
+            if (call.active) return; // this window has the live version already
+
+            el.intelLiveWrap.classList.remove('hidden');
+            el.intelLive.textContent = payload.text;
+            el.intelLiveMeta.textContent = `partial scored ${payload.score} · ${payload.state}`;
+            el.phoneLiveWrap.classList.remove('hidden');
+            el.phoneLive.textContent = payload.text;
+        });
+
         socket.on('session.turn', (turn) => {
             if (turn.sessionId !== state.sessionId) return;
             if (!state.firstSeenAt) state.firstSeenAt = new Date(turn.incoming.at).getTime();
+
+            // A sentence that has landed is no longer being spoken, so the
+            // live bubble for it comes down on every window.
+            if (!call.active) {
+                el.phoneLiveWrap.classList.add('hidden');
+                el.phoneLive.textContent = '';
+            }
 
             // The sending window has already applied this.
             if (intelOnly) {
@@ -986,6 +1418,9 @@
         if (event.key !== 'Escape') return;
         el.networkModal.classList.add('hidden');
         el.reportModal.classList.add('hidden');
+        // Escape is what anyone reaches for when a synthetic voice will not
+        // stop. It silences the decoy without ending the call.
+        if (engine && engine.speaker.speaking) engine.speaker.cancel();
     });
 
     // ---------------------------------------------------------------------
@@ -1034,6 +1469,7 @@
         }
 
         connect();
+        wireCallMode();
         renderState('MONITORING');
         setStatus('MONITORING');
         renderScore(0, [], { label: '—', reasons: [] }, null);
