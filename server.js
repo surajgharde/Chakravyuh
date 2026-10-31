@@ -33,13 +33,16 @@ const start = async () => {
 
     const http = require('node:http');
     const { createApp } = require('./src/app');
-    const { attach } = require('./src/realtime/events');
+    const { attach, lateBoundEmitter } = require('./src/realtime/events');
 
-    // Socket.IO needs the http server, so it is created here rather than
-    // letting Express open the listener itself.
-    const server = http.createServer();
+    // Order matters. Socket.IO takes over the server's request handling and
+    // delegates anything that is not its own path to the listeners that were
+    // already there, so Express must be attached first. The app needs an
+    // emitter before that, hence the late binding.
+    const events = lateBoundEmitter();
+    const server = http.createServer(createApp(config, { events }));
     const { emitter } = attach(server);
-    server.on('request', createApp(config, { events: emitter }));
+    events.bind(emitter);
 
     server.listen(config.port, () => {
         logger.info(`Chakravyuh listening on http://localhost:${config.port}`);

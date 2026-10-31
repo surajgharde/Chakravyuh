@@ -35,6 +35,31 @@ const nullEmitter = () => ({
     events: [],
 });
 
+/**
+ * An emitter that can be pointed at its real transport later.
+ *
+ * Needed because of a boot-order constraint: Socket.IO captures whatever
+ * request listeners the http server already has when it attaches, and
+ * delegates to them for anything that is not its own path. So Express has to be
+ * on the server BEFORE Socket.IO attaches - otherwise both handlers answer the
+ * same request and the client script comes back empty. But the Express app
+ * needs an emitter at construction time. This closes that loop.
+ */
+const lateBoundEmitter = () => {
+    let target = null;
+    return {
+        emit: (name, payload) => {
+            if (target) target.emit(name, payload);
+        },
+        bind: (transport) => {
+            target = transport;
+        },
+        get bound() {
+            return target !== null;
+        },
+    };
+};
+
 /** Records every event in memory. Used by tests and the replay tooling. */
 const recordingEmitter = () => {
     const events = [];
@@ -90,4 +115,4 @@ const attach = (httpServer, { cors = { origin: '*' } } = {}) => {
     return { io, emitter: socketEmitter(io) };
 };
 
-module.exports = { EVENTS, nullEmitter, recordingEmitter, socketEmitter, attach };
+module.exports = { EVENTS, nullEmitter, lateBoundEmitter, recordingEmitter, socketEmitter, attach };

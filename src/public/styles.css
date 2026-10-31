@@ -1,0 +1,244 @@
+/*
+ * The handful of things Tailwind's utilities would make unreadable: the phone
+ * frame, the chat bubbles, and a few repeated component classes.
+ *
+ * Sized for a 1366x768 projector. The three panes fit side by side at that
+ * width with no horizontal scroll, and each pane scrolls internally.
+ */
+
+/* --- panes ---------------------------------------------------------------- */
+
+.pane-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: #6b6760;
+  margin: 0 0 6px 2px;
+  flex-shrink: 0;
+}
+
+.action-btn {
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  border: 1px solid #e4e0d9;
+  background: #fff;
+  transition: background-color 0.12s;
+}
+.action-btn:hover:not(:disabled) { background: #faf9f7; }
+.action-btn:disabled { opacity: 0.4; }
+
+/* --- the phone ------------------------------------------------------------ */
+
+.phone-frame {
+  background: linear-gradient(#fdfdfc, #f6f4f0);
+  border: 7px solid #23211e;
+  border-radius: 26px;
+  overflow: hidden;
+  position: relative;
+  box-shadow: 0 6px 22px rgba(20, 20, 19, 0.16);
+}
+
+.phone-notch {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 84px;
+  height: 15px;
+  background: #23211e;
+  border-bottom-left-radius: 9px;
+  border-bottom-right-radius: 9px;
+  z-index: 10;
+}
+
+/* --- chat bubbles -------------------------------------------------------- */
+
+.bubble {
+  max-width: 84%;
+  padding: 6px 9px;
+  border-radius: 11px;
+  font-size: 12px;
+  line-height: 1.42;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.bubble-them {
+  background: #fff;
+  border: 1px solid #e4e0d9;
+  border-bottom-left-radius: 3px;
+  margin-right: auto;
+}
+
+.bubble-us {
+  background: #dcf3e4;
+  border: 1px solid #b8e0c8;
+  border-bottom-right-radius: 3px;
+  margin-left: auto;
+}
+
+/* A reply the Guardian's decoy sent, rather than the user. */
+.bubble-decoy {
+  background: #e8f0fb;
+  border-color: #c3d8f2;
+}
+
+.bubble-meta {
+  font-size: 9.5px;
+  color: #6b6760;
+  margin-top: 2px;
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+
+/* --- score breakdown ----------------------------------------------------- */
+
+.signal-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 10.5px;
+}
+
+.signal-weight {
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  width: 26px;
+  text-align: right;
+  flex-shrink: 0;
+  font-weight: 700;
+}
+
+.signal-hard { color: #8c3b1e; }
+.signal-soft { color: #b4690e; }
+.signal-minus { color: #1f6f43; }
+
+/* --- identifier rows ----------------------------------------------------- */
+
+.ident-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 0;
+  animation: slide-in 0.3s ease-out;
+}
+
+.ident-type {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b6760;
+  width: 78px;
+  flex-shrink: 0;
+}
+
+.ident-value {
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* --- stage chips --------------------------------------------------------- */
+
+.stage-chip {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 2px 6px;
+  border-radius: 9px;
+  border: 1px solid #e4e0d9;
+  background: #faf9f7;
+  color: #6b6760;
+  white-space: nowrap;
+}
+
+.stage-chip.alarming {
+  border-color: #8c3b1e;
+  background: #fdf1ec;
+  color: #8c3b1e;
+}
+
+/* --- flags --------------------------------------------------------------- */
+
+.flag {
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.flag-warn { color: #b4690e; background: #fdf6ec; }
+.flag-bad { color: #8c3b1e; background: #fdf1ec; }
+.flag-ok { color: #1f6f43; background: #eef7f1; }
+
+/* --- toasts -------------------------------------------------------------- */
+
+.toast {
+  padding: 9px 11px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  border: 1px solid;
+  background: #fff;
+  box-shadow: 0 3px 12px rgba(20, 20, 19, 0.13);
+  animation: toast-in 0.2s ease-out;
+}
+
+.toast-warn { border-color: #b4690e; color: #8a5109; }
+.toast-bad { border-color: #8c3b1e; color: #7a3419; }
+.toast-ok { border-color: #1f6f43; color: #1a5c38; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* --- alerts on the phone ------------------------------------------------- */
+
+.phone-alert {
+  font-size: 10.5px;
+  line-height: 1.38;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid;
+}
+.phone-alert-warn { border-color: #b4690e; background: #fdf6ec; color: #7a4708; }
+.phone-alert-info { border-color: #c3d8f2; background: #f0f5fc; color: #2d4a73; }
+
+/* --- scrollbars, so three scrolling panes do not look industrial --------- */
+
+*::-webkit-scrollbar { width: 7px; height: 7px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #ddd8d0; border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: #c9c3b9; }
+
+/* --- judge mode ---------------------------------------------------------- */
+
+body.judge-mode #pane-intel { display: none; }
+body.judge-mode #pane-scammer { flex: 1 1 auto !important; }
+
+/* The intelligence-only view, for the second screen of a two-screen demo. */
+body.intel-only #pane-phone,
+body.intel-only #pane-scammer { display: none; }
+body.intel-only #pane-intel { flex: 1 1 auto; }
+
+/* --- a narrower projector or a laptop ------------------------------------ */
+
+@media (max-width: 1280px) {
+  #pane-phone { width: 272px !important; }
+  #pane-scammer { flex: 0 0 340px !important; }
+}
+
+@media (max-width: 1024px) {
+  #panes { flex-wrap: wrap; overflow-y: auto; }
+  #pane-phone, #pane-scammer, #pane-intel { flex: 1 1 320px !important; width: auto !important; }
+}

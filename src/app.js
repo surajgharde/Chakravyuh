@@ -66,12 +66,19 @@ const createApp = (config, deps = {}) => {
         });
     });
 
+    /**
+     * The demo console's own files, served BEFORE the API key check.
+     *
+     * The page is static HTML, CSS and JavaScript with no data in it. Putting
+     * it behind the key check only means the browser gets a 401 for the page
+     * itself, since it cannot send a header for a top-level navigation. Every
+     * /api route below is still protected.
+     */
+    app.use(express.static(path.join(__dirname, 'public')));
+
     app.use(requireApiKey(config.apiSecretKey));
 
     app.use('/api', createRouter({ llm, config, events }));
-
-    // The demo console.
-    app.use(express.static(path.join(__dirname, 'public')));
 
     app.use((err, _req, res, _next) => {
         logger.error(`Unhandled: ${err.stack || err.message}`);

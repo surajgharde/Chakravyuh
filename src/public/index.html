@@ -4,64 +4,314 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chakravyuh</title>
-<style>
-  :root {
-    --bg: #faf9f7;
-    --fg: #1c1b19;
-    --muted: #6b6760;
-    --line: #e2ded7;
-    --accent: #8c3b1e;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #171614; --fg: #ece9e4; --muted: #9a948b; --line: #302d29; --accent: #e08a68;
-    }
-  }
-  :root[data-theme="dark"] {
-    --bg: #171614; --fg: #ece9e4; --muted: #9a948b; --line: #302d29; --accent: #e08a68;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    padding-block: 3rem; padding-left: 1.25rem; padding-right: 1.25rem;
-  }
-  main { max-width: 42rem; margin: 0 auto; }
-  h1 { font-size: 1.6rem; letter-spacing: -0.01em; margin: 0 0 0.25rem; }
-  .sub { color: var(--muted); margin: 0 0 2rem; }
-  h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em;
-       color: var(--muted); margin: 2rem 0 0.75rem; font-weight: 600; }
-  ul { padding-left: 1.2rem; margin: 0; }
-  li { margin-bottom: 0.4rem; }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.875em;
-         background: color-mix(in srgb, var(--fg) 7%, transparent);
-         padding: 0.1em 0.35em; border-radius: 3px; }
-  .note { border-left: 2px solid var(--accent); padding: 0.1rem 0 0.1rem 1rem;
-          color: var(--muted); margin: 2rem 0 0; }
-  a { color: var(--accent); }
-</style>
+
+<!-- Tailwind's play CDN. No build step, by design: this page has to run from a
+     clone with nothing but `npm start`. -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink: '#141413', paper: '#faf9f7', line: '#e4e0d9',
+          muted: '#6b6760', brick: '#8c3b1e', moss: '#1f6f43', amber: '#b4690e',
+        },
+        fontFamily: {
+          sans: ['Segoe UI', 'system-ui', '-apple-system', 'sans-serif'],
+          mono: ['Cascadia Mono', 'Consolas', 'monospace'],
+        },
+      },
+    },
+  };
+</script>
+
+<!-- Socket.IO client, served by our own server rather than a CDN. -->
+<script src="/socket.io/socket.io.js"></script>
+
+<!-- vis-network, for the identifier graph. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js"></script>
+
+<link rel="stylesheet" href="styles.css">
 </head>
-<body>
-<main>
-  <h1>Chakravyuh</h1>
-  <p class="sub">A three-agent defensive system for scam calls and chats.</p>
 
-  <h2>Status</h2>
-  <p>The API is running. The operator console is built in a later phase; for now the
-     endpoints below are the interface.</p>
+<body class="h-screen overflow-hidden bg-paper text-ink font-sans text-[13px] antialiased">
 
-  <h2>Endpoints</h2>
-  <ul>
-    <li><code>GET /health</code> — no key required</li>
-    <li><code>POST /api/message</code> — one inbound message</li>
-    <li><code>GET /api/sessions</code> — recent sessions</li>
-    <li><code>GET /api/sessions/:sessionId</code> — one session in full</li>
-  </ul>
-  <p>Every route except <code>/health</code> requires an <code>x-api-key</code> header.</p>
+<!-- ===================== header ===================== -->
+<header class="h-12 shrink-0 border-b border-line bg-white flex items-center gap-4 px-4">
+  <div class="flex items-baseline gap-2">
+    <span class="font-bold tracking-tight text-[15px]">Chakravyuh</span>
+    <span class="text-muted text-[11px]">scam-baiting defence &middot; CYBER-01</span>
+  </div>
 
-  <p class="note">The decoy only ever replies after the Guardian has confirmed a scam.
-     On a legitimate caller the response carries the assessment and
-     <code>reply: null</code>.</p>
+  <div class="flex items-center gap-2 text-[11px]">
+    <span class="text-muted">session</span>
+    <code id="session-id" class="font-mono bg-paper border border-line px-1.5 py-0.5 rounded">—</code>
+  </div>
+
+  <div id="conn" class="flex items-center gap-1.5 text-[11px] text-muted">
+    <span id="conn-dot" class="w-2 h-2 rounded-full bg-muted"></span>
+    <span id="conn-label">connecting</span>
+  </div>
+
+  <div class="ml-auto flex items-center gap-2">
+    <span id="llm-badge" class="hidden text-[11px] px-2 py-1 rounded border border-amber text-amber bg-amber/5"></span>
+    <span id="demo-badge" class="hidden text-[11px] px-2 py-1 rounded border border-line text-muted">DEMO_MODE</span>
+
+    <label class="flex items-center gap-1.5 text-[11px] cursor-pointer select-none px-2 py-1 rounded border border-line hover:bg-paper">
+      <input type="checkbox" id="judge-mode" class="accent-brick">
+      <span>Judge mode</span>
+    </label>
+
+    <button id="btn-reset"
+            class="text-[11px] px-2.5 py-1 rounded border border-line hover:bg-paper">
+      Reset
+    </button>
+  </div>
+</header>
+
+<!-- ===================== the three panes ===================== -->
+<main id="panes" class="flex gap-3 p-3" style="height: calc(100vh - 3rem)">
+
+  <!-- ---------- 1. the elderly user's phone ---------- -->
+  <section id="pane-phone" class="shrink-0 flex flex-col" style="width: 312px">
+    <h2 class="pane-title">What Sudha sees</h2>
+
+    <div class="phone-frame flex-1 flex flex-col min-h-0">
+      <div class="phone-notch"></div>
+
+      <!-- caller strip -->
+      <div class="px-3 py-2 border-b border-line bg-white/70">
+        <div class="flex items-center justify-between">
+          <div>
+            <div id="phone-caller" class="font-semibold text-[12px]">No call</div>
+            <div id="phone-channel" class="text-[10px] text-muted">—</div>
+          </div>
+          <div id="phone-clock" class="font-mono text-[11px] text-muted">00:00</div>
+        </div>
+      </div>
+
+      <!-- guardian banner -->
+      <div id="takeover-banner" class="hidden px-3 py-2 bg-moss/10 border-b border-moss/40">
+        <div class="text-[11px] font-semibold text-moss leading-snug" id="takeover-en"></div>
+        <div class="text-[11px] text-moss/80 leading-snug mt-0.5" id="takeover-mr"></div>
+      </div>
+
+      <!-- alerts the guardian shows the user -->
+      <div id="phone-alerts" class="px-3 pt-2 space-y-1.5"></div>
+
+      <!-- chat -->
+      <div id="phone-chat" class="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0"></div>
+
+      <!-- status + the genuine button -->
+      <div class="px-3 py-2 border-t border-line bg-white/70 space-y-2">
+        <div>
+          <div id="status-en" class="text-[11px] leading-snug">Waiting for a call.</div>
+          <div id="status-mr" class="text-[11px] text-muted leading-snug">कॉलची वाट पाहत आहे.</div>
+        </div>
+        <button id="btn-genuine"
+                class="w-full text-[12px] font-semibold px-3 py-2 rounded border border-brick text-brick
+                       hover:bg-brick hover:text-white disabled:opacity-40 disabled:hover:bg-transparent
+                       disabled:hover:text-brick transition-colors"
+                disabled>
+          This is genuine — stop
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------- 2. the scammer console ---------- -->
+  <section id="pane-scammer" class="flex flex-col min-w-0" style="flex: 0 0 400px">
+    <h2 class="pane-title">Scammer console <span class="text-muted font-normal normal-case tracking-normal">— you type here</span></h2>
+
+    <div class="flex-1 flex flex-col min-h-0 bg-white border border-line rounded-lg overflow-hidden">
+
+      <!-- scenarios -->
+      <div class="p-2.5 border-b border-line">
+        <div class="text-[10px] uppercase tracking-wider text-muted mb-1.5 font-semibold">Load a scenario</div>
+        <div id="scenario-buttons" class="grid grid-cols-2 gap-1.5"></div>
+        <div id="scenario-note" class="hidden mt-1.5 text-[10px] text-muted leading-snug"></div>
+      </div>
+
+      <!-- channel + sender -->
+      <div class="p-2.5 border-b border-line grid grid-cols-2 gap-2">
+        <label class="block">
+          <span class="text-[10px] uppercase tracking-wider text-muted font-semibold">Channel</span>
+          <select id="channel"
+                  class="mt-0.5 w-full text-[12px] border border-line rounded px-2 py-1.5 bg-white">
+            <option value="WhatsApp">WhatsApp</option>
+            <option value="SMS">SMS</option>
+            <option value="Call" selected>Call transcript</option>
+          </select>
+        </label>
+        <label class="block">
+          <span class="text-[10px] uppercase tracking-wider text-muted font-semibold">Sender number</span>
+          <input id="from" type="text" value="+919812345678" spellcheck="false"
+                 class="mt-0.5 w-full text-[12px] font-mono border border-line rounded px-2 py-1.5">
+        </label>
+      </div>
+
+      <!-- what the scammer has sent, and what came back -->
+      <div id="scammer-log" class="flex-1 overflow-y-auto p-2.5 space-y-2 min-h-0 bg-paper/40"></div>
+
+      <!-- composer -->
+      <form id="composer" class="p-2.5 border-t border-line space-y-2">
+        <textarea id="message" rows="3" spellcheck="false"
+                  placeholder="Type as the scammer, then press Send (Ctrl+Enter)"
+                  class="w-full text-[12px] border border-line rounded px-2 py-1.5 resize-none
+                         focus:outline-none focus:ring-1 focus:ring-brick/40"></textarea>
+        <div class="flex items-center gap-2">
+          <button type="submit" id="btn-send"
+                  class="text-[12px] font-semibold px-4 py-1.5 rounded bg-ink text-white
+                         hover:bg-brick disabled:opacity-40 transition-colors">
+            Send
+          </button>
+          <button type="button" id="btn-next"
+                  class="hidden text-[11px] px-2.5 py-1.5 rounded border border-line hover:bg-paper">
+            Next scripted line
+          </button>
+          <span id="send-state" class="text-[11px] text-muted"></span>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- ---------- 3. the intelligence panel ---------- -->
+  <section id="pane-intel" class="flex flex-col min-w-0 flex-1">
+    <h2 class="pane-title">Intelligence</h2>
+
+    <div class="flex-1 min-h-0 bg-white border border-line rounded-lg flex flex-col overflow-hidden">
+
+      <!-- state + score -->
+      <div class="p-2.5 border-b border-line">
+        <div class="flex items-start gap-3">
+          <div class="shrink-0">
+            <div class="text-[10px] uppercase tracking-wider text-muted font-semibold">State</div>
+            <div id="state-badge" class="mt-0.5 inline-block text-[12px] font-bold px-2 py-1 rounded border">
+              MONITORING
+            </div>
+          </div>
+
+          <div class="flex-1 min-w-0">
+            <div class="flex items-baseline justify-between">
+              <span class="text-[10px] uppercase tracking-wider text-muted font-semibold">Risk score</span>
+              <span class="text-[10px] text-muted">
+                engage at <span id="th-decoy">60</span> &middot; warn at <span id="th-susp">30</span>
+              </span>
+            </div>
+            <div class="flex items-center gap-2 mt-0.5">
+              <div class="flex-1 h-2.5 bg-paper border border-line rounded-full overflow-hidden relative">
+                <div id="score-bar" class="h-full bg-amber transition-all duration-300" style="width:0%"></div>
+                <div id="score-mark" class="absolute top-0 bottom-0 w-px bg-brick/60" style="left:60%"></div>
+              </div>
+              <span id="score-value" class="font-mono font-bold text-[14px] tabular-nums w-8 text-right">0</span>
+            </div>
+            <div id="classifier" class="text-[10px] text-muted mt-1">classifier: —</div>
+          </div>
+
+          <div class="shrink-0 text-right">
+            <div class="text-[10px] uppercase tracking-wider text-muted font-semibold">Time wasted</div>
+            <div id="wasted" class="font-mono font-bold text-[16px] tabular-nums">00:00</div>
+          </div>
+        </div>
+
+        <!-- score breakdown -->
+        <div id="breakdown" class="mt-2 space-y-0.5"></div>
+      </div>
+
+      <!-- scrolling body -->
+      <div class="flex-1 overflow-y-auto min-h-0">
+
+        <!-- identifiers -->
+        <div class="p-2.5 border-b border-line">
+          <div class="flex items-baseline justify-between mb-1.5">
+            <span class="text-[10px] uppercase tracking-wider text-muted font-semibold">Identifiers extracted</span>
+            <span id="identifier-count" class="text-[10px] text-muted">0</span>
+          </div>
+          <div id="identifiers" class="space-y-1">
+            <div class="text-[11px] text-muted italic">Nothing yet.</div>
+          </div>
+        </div>
+
+        <!-- script stages -->
+        <div class="p-2.5 border-b border-line">
+          <div class="text-[10px] uppercase tracking-wider text-muted font-semibold mb-1.5">Script stages</div>
+          <div id="stages" class="flex flex-wrap gap-1">
+            <div class="text-[11px] text-muted italic">Nothing yet.</div>
+          </div>
+        </div>
+
+        <!-- the decoy -->
+        <div class="p-2.5 border-b border-line">
+          <div class="text-[10px] uppercase tracking-wider text-muted font-semibold mb-1.5">Decoy</div>
+          <dl class="grid grid-cols-[88px_1fr] gap-x-2 gap-y-0.5 text-[11px]">
+            <dt class="text-muted">Asking for</dt><dd id="decoy-target" class="font-medium">—</dd>
+            <dt class="text-muted">Stalling with</dt><dd id="decoy-excuse">—</dd>
+            <dt class="text-muted">Language</dt><dd id="decoy-language">—</dd>
+            <dt class="text-muted">Source</dt><dd id="decoy-source">—</dd>
+          </dl>
+          <div id="decoy-flags" class="mt-1.5 flex flex-wrap gap-1"></div>
+        </div>
+
+        <!-- guardian decisions -->
+        <div class="p-2.5">
+          <div class="text-[10px] uppercase tracking-wider text-muted font-semibold mb-1.5">Guardian decisions</div>
+          <div id="decisions" class="space-y-1 font-mono text-[10px]">
+            <div class="text-[11px] text-muted italic font-sans">Nothing yet.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- actions -->
+      <div class="p-2.5 border-t border-line flex flex-wrap gap-1.5">
+        <button id="btn-report" class="action-btn" disabled>View report</button>
+        <button id="btn-pdf" class="action-btn" disabled>Download PDF</button>
+        <button id="btn-network" class="action-btn">Network graph</button>
+      </div>
+    </div>
+  </section>
 </main>
+
+<!-- ===================== network graph modal ===================== -->
+<div id="network-modal" class="hidden fixed inset-0 z-40 bg-ink/50 p-6">
+  <div class="bg-white rounded-lg h-full flex flex-col overflow-hidden border border-line">
+    <div class="h-11 shrink-0 px-4 flex items-center gap-3 border-b border-line">
+      <span class="font-bold text-[14px]">Identifier network</span>
+      <span id="network-stats" class="text-[11px] text-muted"></span>
+      <button id="btn-network-close" class="ml-auto text-[12px] px-2.5 py-1 rounded border border-line hover:bg-paper">
+        Close
+      </button>
+    </div>
+    <div class="flex-1 flex min-h-0">
+      <div id="network-canvas" class="flex-1 min-w-0"></div>
+      <aside class="w-72 shrink-0 border-l border-line overflow-y-auto p-3">
+        <div class="text-[10px] uppercase tracking-wider text-muted font-semibold mb-2">Clusters</div>
+        <div id="network-clusters" class="space-y-2"></div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== report modal ===================== -->
+<div id="report-modal" class="hidden fixed inset-0 z-40 bg-ink/50 p-6">
+  <div class="bg-white rounded-lg h-full flex flex-col overflow-hidden border border-line">
+    <div class="h-11 shrink-0 px-4 flex items-center gap-3 border-b border-line">
+      <span class="font-bold text-[14px]">Evidence report</span>
+      <span id="report-status" class="text-[11px]"></span>
+      <label class="ml-auto flex items-center gap-1.5 text-[12px] cursor-pointer select-none">
+        <input type="checkbox" id="reviewed" class="accent-moss">
+        <span>Reviewed by family member</span>
+      </label>
+      <button id="btn-report-close" class="text-[12px] px-2.5 py-1 rounded border border-line hover:bg-paper">
+        Close
+      </button>
+    </div>
+    <iframe id="report-frame" class="flex-1 w-full border-0" title="Evidence report"></iframe>
+  </div>
+</div>
+
+<!-- ===================== toasts ===================== -->
+<div id="toasts" class="fixed bottom-4 right-4 z-50 space-y-2 w-80"></div>
+
+<script src="app.js"></script>
 </body>
 </html>
