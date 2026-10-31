@@ -292,11 +292,11 @@ const mask = (text, start, length) => text.slice(0, start) + ' '.repeat(length) 
 const normalizePhone = (raw) => {
     const digits = asciiDigits(raw).replace(/\D/g, '');
 
-    // Strip a leading country code or trunk zero.
-    let national = digits;
-    if (national.length > 10 && national.startsWith('0091')) national = national.slice(4);
+    // Strip the trunk zero or an international prefix first, THEN the country
+    // code. Doing it in the other order left "0919876543210" as twelve digits
+    // and returned null.
+    let national = digits.replace(/^0+/, '');
     if (national.length > 10 && national.startsWith('91')) national = national.slice(2);
-    while (national.length > 10 && national.startsWith('0')) national = national.slice(1);
 
     if (national.length === 10 && /^[6-9]/.test(national)) return `+91${national}`;
     return null;

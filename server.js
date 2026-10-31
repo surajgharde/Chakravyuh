@@ -31,12 +31,20 @@ const start = async () => {
 
     await db.connect(config);
 
+    const http = require('node:http');
     const { createApp } = require('./src/app');
-    const app = createApp(config);
+    const { attach } = require('./src/realtime/events');
 
-    const server = app.listen(config.port, () => {
+    // Socket.IO needs the http server, so it is created here rather than
+    // letting Express open the listener itself.
+    const server = http.createServer();
+    const { emitter } = attach(server);
+    server.on('request', createApp(config, { events: emitter }));
+
+    server.listen(config.port, () => {
         logger.info(`Chakravyuh listening on http://localhost:${config.port}`);
         logger.info(`Health: http://localhost:${config.port}/health`);
+        logger.info('Guardian events on Socket.IO: guardian.score, guardian.state_changed, guardian.takeover, guardian.released');
     });
 
     const shutdown = async (signal) => {

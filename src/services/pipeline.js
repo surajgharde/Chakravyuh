@@ -1,11 +1,12 @@
 /**
  * One turn of the system, end to end.
  *
- *   normalize -> extract entities -> tag script stages -> Guardian -> (Decoy) -> persist
+ *   normalize -> extract entities -> tag script stages -> GUARDIAN -> (DECOY) -> persist
  *
- * The Decoy runs only when the Guardian returns ENGAGE. On PASS or WATCH the
- * conversation is left alone and no reply is generated, which is what protects a
- * legitimate caller from being baited.
+ * The Guardian owns the session state. The Decoy runs only when the Guardian
+ * has put the session in DECOY_ACTIVE. In MONITORING, SUSPICIOUS, LEGIT, ENDED
+ * or FALSE_POSITIVE no reply is generated at all, which is what keeps a real
+ * caller from ever being baited.
  *
  * Every counter and duration written here is measured. Nothing is padded.
  */
@@ -16,6 +17,7 @@ const decoy = require('../agents/decoy');
 const extractor = require('./extractor');
 const stages = require('./stages');
 const logger = require('./logger');
+const trustedContacts = require('./trustedContacts');
 const { normalizeMessage, normalizeHistory } = require('./normalize');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,7 +37,7 @@ class PipelineError extends Error {
  * caller supplied any, and otherwise from the server's own receive time. It is
  * never back-dated to make a duration look longer.
  */
-const loadOrCreate = async ({ sessionId, history, metadata, receivedAt }) => {
+const loadOrCreate = async ({ sessionId, history, metadata, receivedAt, userId }) => {
     const existing = await Session.findOne({ sessionId });
     if (existing) return { session: existing, created: false };
 
@@ -44,6 +46,7 @@ const loadOrCreate = async ({ sessionId, history, metadata, receivedAt }) => {
 
     const session = new Session({
         sessionId,
+        userId,
         firstSeenAt,
         lastSeenAt: receivedAt,
         channel: metadata.channel || 'unknown',
@@ -76,14 +79,25 @@ const refreshScriptStages = (session) => {
 };
 
 /**
+ * Where the caller's identity comes from. `metadata.from` is the number or
+ * handle the message arrived on; it is what trusted contacts are matched
+ * against.
+ */
+const callerIdFrom = (metadata, message) => metadata.from
+    ?? metadata.sender
+    ?? metadata.callerId
+    ?? message?.from
+    ?? null;
+
+/**
  * Handles one inbound message.
  *
  * @param {object} body   the request body
- * @param {object} deps   { llm, config }
+ * @param {object} deps   { llm, config, events }
  * @returns {Promise<object>} the turn result
  */
 const handleTurn = async (body, deps = {}) => {
-    const { llm = null, config = {} } = deps;
+    const { llm = null, config = {}, events = null } = deps;
     const receivedAt = new Date();
 
     const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
@@ -94,8 +108,10 @@ const handleTurn = async (body, deps = {}) => {
 
     const history = normalizeHistory(body?.conversationHistory);
     const metadata = body?.metadata && typeof body.metadata === 'object' ? body.metadata : {};
+    const userId = (metadata.userId || body?.userId || trustedContacts.DEFAULT_USER_ID).toString();
+    const from = callerIdFrom(metadata, body?.message);
 
-    const { session, created } = await loadOrCreate({ sessionId, history, metadata, receivedAt });
+    const { session, created } = await loadOrCreate({ sessionId, history, metadata, receivedAt, userId });
 
     // A returning session may carry metadata it did not have on the first turn.
     if (!created) {
@@ -131,8 +147,10 @@ const handleTurn = async (body, deps = {}) => {
     if (incoming.role === 'scammer') session.scammerMessageCount += 1;
     session.lastSeenAt = receivedAt;
 
-    // Entities, from the scammer side only, with full provenance.
-    const entities = incoming.role === 'scammer'
+    const isIncomingFromCounterpart = incoming.role === 'scammer';
+
+    // Entities, from the counterpart's side only, with full provenance.
+    const entities = isIncomingFromCounterpart
         ? extractor.extractEntities(incoming.text, {
             sessionId,
             messageId,
@@ -142,47 +160,51 @@ const handleTurn = async (body, deps = {}) => {
     const merged = extractor.mergeInto(session, entities);
 
     // Script stages for this message: rules, then one LLM call for the rest.
-    const messageStages = incoming.role === 'scammer'
-        ? await stages.tag(incoming.text, { llm })
-        : [];
+    const messageStages = isIncomingFromCounterpart ? await stages.tag(incoming.text, { llm }) : [];
     session.messages[session.messages.length - 1].stages = messageStages;
     refreshScriptStages(session);
 
-    // Guardian.
-    const scammerMessages = session.messages.filter((m) => m.role === 'scammer');
-    const assessment = await guardian.assess({
-        incomingText: incoming.text,
-        priorScammerMessages: scammerMessages.slice(0, -1),
-        llm,
-        summary: session.intelligence,
-        scriptStages: session.scriptStages,
-    });
+    // Guardian: scores the message and owns the state transition.
+    const priorCounterpartTexts = session.messages
+        .filter((m) => m.role === 'scammer')
+        .slice(0, -1)
+        .map((m) => m.text);
 
-    session.confidence = assessment.confidence;
-    session.signals = assessment.signalIds;
-    if (assessment.scamType && assessment.scamType !== 'unknown') session.scamType = assessment.scamType;
+    const verdict = isIncomingFromCounterpart
+        ? await guardian.handleMessage({
+            session,
+            text: incoming.text,
+            entities,
+            allEntities: session.entities,
+            priorTexts: priorCounterpartTexts,
+            scriptStages: session.scriptStages,
+            llm,
+            events,
+            thresholds: config.guardianThresholds || {},
+            from,
+            userId,
+        })
+        : null;
 
-    const wasEngaged = session.stage === 'engaged';
-    let handedOffThisTurn = false;
-
-    if (assessment.stage === guardian.STAGES.ENGAGE && session.stage === 'monitoring') {
-        session.stage = 'engaged';
-        session.scamDetected = true;
-        session.handoffAtMessage = session.messageCount;
-        handedOffThisTurn = true;
-        logger.info(`Hand-off to decoy on session ${sessionId} at message ${session.messageCount} (confidence ${assessment.confidence}).`);
+    if (verdict) {
+        const scamType = guardian.classifyScamType(
+            session.messages.filter((m) => m.role === 'scammer').map((m) => m.text).join('\n')
+        );
+        if (scamType !== 'unknown') session.scamType = scamType;
     }
 
-    // A stand-down is a real outcome: the Guardian can withdraw the decoy.
-    const limit = session.stage === 'engaged' ? decoy.shouldStandDown(session) : { standDown: false };
-    if (limit.standDown) {
-        session.stage = 'stood_down';
-        logger.info(`Decoy stood down on session ${sessionId}: ${limit.reason}.`);
+    // The decoy stands down on its own limits, independently of the score.
+    if (session.guardianState === guardian.STATES.DECOY_ACTIVE) {
+        const limit = decoy.shouldStandDown(session);
+        if (limit.standDown) {
+            await guardian.endSession({ session, events, reason: limit.reason });
+            logger.info(`Decoy stood down on session ${sessionId}: ${limit.reason}.`);
+        }
     }
 
-    // Decoy, only while engaged.
+    // Decoy, only while the Guardian has the session engaged.
     let decoyResult = null;
-    if (session.stage === 'engaged') {
+    if (session.guardianState === guardian.STATES.DECOY_ACTIVE) {
         decoyResult = await decoy.respond({
             session,
             history: session.messages.slice(0, -1),
@@ -204,8 +226,8 @@ const handleTurn = async (body, deps = {}) => {
         if (decoyResult.observed) session.agentNotes = decoyResult.observed;
     }
 
-    if (!session.agentNotes && assessment.classifier.rationale) {
-        session.agentNotes = assessment.classifier.rationale;
+    if (!session.agentNotes && verdict?.classifier.reasons.length > 0) {
+        session.agentNotes = verdict.classifier.reasons.join('; ');
     }
 
     session.markModified('messages');
@@ -218,20 +240,35 @@ const handleTurn = async (body, deps = {}) => {
 
     return {
         sessionId,
+        // What the counterpart receives. Null unless the decoy is engaged.
         reply: decoyResult ? decoyResult.reply : null,
-        action: session.stage === 'engaged' ? 'decoy_engaged' : session.stage,
-        guardian: {
-            stage: assessment.stage,
-            scamDetected: session.scamDetected,
-            confidence: assessment.confidence,
-            ruleConfidence: assessment.ruleConfidence,
-            scamType: session.scamType,
-            signals: assessment.signals,
-            hasHardSignal: assessment.hasHardSignal,
-            classifier: assessment.classifier,
-            handedOffThisTurn,
-            wasAlreadyEngaged: wasEngaged,
-        },
+        state: session.guardianState,
+        guardian: verdict
+            ? {
+                state: verdict.state,
+                previousState: verdict.previousState,
+                changed: verdict.changed,
+                takeover: verdict.engagedNow,
+                released: verdict.released,
+                trustedContact: verdict.trustedContact,
+                // Confidence is the score, its breakdown and the label, side by
+                // side. No probability is invented.
+                score: verdict.score,
+                rawScore: verdict.rawScore,
+                breakdown: verdict.breakdown,
+                firedSignals: verdict.firedSignals,
+                hardSignals: verdict.hardSignals,
+                ruleState: verdict.ruleState,
+                classifier: verdict.classifier,
+                thresholds: verdict.thresholds,
+                notes: verdict.notes,
+                decisionMs: verdict.decisionMs,
+                scamType: session.scamType,
+            }
+            : null,
+        // What the protected user, and a family contact, are shown.
+        alerts: verdict ? verdict.alerts : [],
+        takeoverNotice: verdict ? verdict.takeoverNotice : null,
         decoy: decoyResult
             ? { askedFor: decoyResult.askedFor, source: decoyResult.source, violations: decoyResult.violations }
             : null,
@@ -255,4 +292,42 @@ const handleTurn = async (body, deps = {}) => {
     };
 };
 
-module.exports = { handleTurn, PipelineError, loadOrCreate, refreshScriptStages };
+/**
+ * The protected user pressed "This is genuine".
+ *
+ * Ends the engagement immediately, returns the one neutral line to send so the
+ * thread does not stop dead, and marks the session FALSE_POSITIVE.
+ */
+const markGenuine = async (sessionId, deps = {}) => {
+    const { events = null } = deps;
+
+    const session = await Session.findOne({ sessionId });
+    if (!session) throw new PipelineError('Session not found.', 404);
+
+    const result = await guardian.markGenuine({ session, events });
+
+    // The neutral line is recorded in the transcript like any other reply, so
+    // the thread stays coherent and the report shows exactly what was said.
+    session.messages.push({
+        messageId: session.nextMessageId(),
+        role: 'decoy',
+        text: result.handbackLine,
+        ts: null,
+        receivedAt: new Date(),
+    });
+    session.messageCount += 1;
+    session.decoyMessageCount += 1;
+    session.markModified('messages');
+    await session.save();
+
+    return {
+        sessionId,
+        state: result.state,
+        previousState: result.previousState,
+        reply: result.handbackLine,
+        offerTrustedContact: result.offerTrustedContact,
+        counterpartId: result.counterpartId,
+    };
+};
+
+module.exports = { handleTurn, markGenuine, PipelineError, loadOrCreate, refreshScriptStages };

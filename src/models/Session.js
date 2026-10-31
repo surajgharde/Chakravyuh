@@ -8,7 +8,8 @@ const { STAGES } = require('../services/stages');
  * Every number stored here is measured, not assigned:
  *   - firstSeenAt / lastSeenAt are server receive times,
  *   - messageCount counts messages actually recorded,
- *   - confidence comes from the Guardian's documented weights.
+ *   - score is the sum of the Guardian's fixed signal weights, and
+ *     scoreBreakdown records which ones produced it.
  */
 
 /** A stage tag, with the method that produced it. */
@@ -57,20 +58,51 @@ for (const field of Object.values(SUMMARY_FIELDS)) {
 // Tactic hints. Not evidence, and counted separately from identifiers.
 intelligenceShape.suspiciousKeywords = { type: [String], default: [] };
 
+/** One rule signal that fired, with the weight it contributed. */
+const ScoreLineSchema = new mongoose.Schema({
+    id: { type: String, required: true },
+    label: { type: String, default: '' },
+    weight: { type: Number, required: true },
+    hard: { type: Boolean, default: false },
+    description: { type: String, default: '' },
+}, { _id: false });
+
 const SessionSchema = new mongoose.Schema({
     sessionId: { type: String, required: true, unique: true, index: true },
 
-    // Guardian state
-    stage: {
+    // Which protected user this conversation belongs to, and who is on the
+    // other end (normalised, so it can be matched against trusted contacts).
+    userId: { type: String, default: 'default-user', index: true },
+    counterpartId: { type: String, default: null, index: true },
+
+    // Guardian state machine.
+    guardianState: {
         type: String,
-        enum: ['monitoring', 'engaged', 'stood_down'],
-        default: 'monitoring',
+        enum: ['MONITORING', 'SUSPICIOUS', 'DECOY_ACTIVE', 'ENDED', 'LEGIT', 'FALSE_POSITIVE'],
+        default: 'MONITORING',
     },
+
     scamDetected: { type: Boolean, default: false },
-    confidence: { type: Number, default: 0 }, // 0..1, computed from signals
     scamType: { type: String, default: 'unknown' },
-    signals: { type: [String], default: [] }, // which detection rules fired
+
+    // The rule score, 0-100, with the breakdown that produced it. There is no
+    // separate probability: this and the classifier label are the confidence.
+    score: { type: Number, default: 0 },
+    scoreBreakdown: { type: [ScoreLineSchema], default: [] },
+    firedSignals: { type: [String], default: [] },
+    classifierLabel: { type: String, default: 'unavailable' },
+    classifierReasons: { type: [String], default: [] },
+
     handoffAtMessage: { type: Number, default: null }, // message index of the hand-off
+    takeoverAt: { type: Date, default: null },
+
+    // Set when the protected user pressed "This is genuine".
+    falsePositive: {
+        markedAt: { type: Date, default: null },
+        markedByUser: { type: Boolean, default: false },
+        previousState: { type: String, default: null },
+        reason: { type: String, default: null },
+    },
 
     // Measured counters
     messageCount: { type: Number, default: 0 },
@@ -117,6 +149,11 @@ SessionSchema.methods.engagementDurationSeconds = function engagementDurationSec
 /** The next message id for this session. */
 SessionSchema.methods.nextMessageId = function nextMessageId() {
     return `m${this.messages.length + 1}`;
+};
+
+/** True while the decoy holds the conversation. */
+SessionSchema.methods.isEngaged = function isEngaged() {
+    return this.guardianState === 'DECOY_ACTIVE';
 };
 
 module.exports = mongoose.models.Session || mongoose.model('Session', SessionSchema);

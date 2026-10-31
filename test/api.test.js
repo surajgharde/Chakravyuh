@@ -18,14 +18,28 @@ let mongoServer;
 let server;
 let baseUrl;
 
-/** An LLM that confirms a scam and plays the persona. */
+/**
+ * A stand-in for the model.
+ *
+ * The classifier branch judges by content rather than answering "scam" to
+ * everything: a stub that cries scam at a delivery message would make the
+ * legitimate-caller tests pass for the wrong reason.
+ */
 const stubLlm = () => new LlmClient(
     { baseUrl: 'x', apiKey: 'placeholder', model: 'm', timeoutMs: 500 },
     {
         transport: async (request) => {
             const system = request.messages[0].content;
-            if (system.includes('fraud analyst')) {
-                return JSON.stringify({ intent: 'scam', scamType: 'bank_fraud', rationale: 'Demanded an OTP under threat.' });
+            const incoming = request.messages[request.messages.length - 1].content;
+
+            if (system.includes('protect an elderly person')) {
+                const looksLikeScam = /otp|blocked|transfer|upi|account\s*number|arrest|warrant/i.test(incoming);
+                return JSON.stringify(looksLikeScam
+                    ? { label: 'scam', reasons: ['demands an OTP', 'threatens to block the account'] }
+                    : { label: 'legit', reasons: ['an ordinary delivery or family message'] });
+            }
+            if (system.includes('stages of the scam script')) {
+                return JSON.stringify({ stages: [] });
             }
             return JSON.stringify({
                 reply: 'Haan beta, which number should I type?',
@@ -95,10 +109,10 @@ test('a legitimate message gets no decoy reply', async () => {
 
     const body = await response.json();
     assert.equal(response.status, 200);
-    assert.equal(body.guardian.stage, 'pass');
-    assert.equal(body.guardian.scamDetected, false);
+    assert.equal(body.state, 'MONITORING');
+    assert.equal(body.guardian.state, 'MONITORING');
     assert.equal(body.reply, null, 'a real caller is never baited');
-    assert.equal(body.action, 'monitoring');
+    assert.deepEqual(body.alerts, [], 'nothing to warn the user about');
 });
 
 test('a scam message hands off and the decoy answers', async () => {
@@ -114,11 +128,20 @@ test('a scam message hands off and the decoy answers', async () => {
     });
 
     const body = await response.json();
-    assert.equal(body.guardian.stage, 'engage');
-    assert.equal(body.guardian.handedOffThisTurn, true);
-    assert.equal(body.action, 'decoy_engaged');
+    assert.equal(body.guardian.state, 'DECOY_ACTIVE');
+    assert.equal(body.guardian.takeover, true);
+    assert.equal(body.state, 'DECOY_ACTIVE');
     assert.ok(body.reply && body.reply.length > 0);
-    assert.equal(body.guardian.handedOffThisTurn, true);
+
+    // The user is told what happened, in both languages.
+    assert.equal(body.takeoverNotice.en, "Guardian has taken over this conversation. You don't need to reply.");
+    assert.ok(body.takeoverNotice.mr.length > 0);
+
+    // The score is traceable: a number plus the rules that produced it.
+    assert.ok(body.guardian.score >= 60);
+    assert.ok(body.guardian.breakdown.length > 0);
+    assert.ok(body.guardian.hardSignals.length > 0);
+    assert.ok(body.guardian.decisionMs < 1500);
 });
 
 test('identifiers the scammer sends are extracted into the session', async () => {
@@ -362,4 +385,176 @@ test('a Marathi scam message is handled end to end', async () => {
     const tagged = body.scriptStages.thisMessage.map((t) => t.stage);
     assert.ok(tagged.includes('PAYMENT_DEMAND'));
     assert.ok(tagged.includes('ISOLATION'));
+});
+
+// ---------------------------------------------------------------------------
+// Guardian state, alerts and the "This is genuine" button, end to end
+// ---------------------------------------------------------------------------
+
+test('a suspicious message warns the user and sends no reply', async () => {
+    const response = await post('/api/message', {
+        sessionId: 'suspicious-1',
+        message: {
+            sender: 'scammer',
+            text: 'This is TRAI. Your Aadhaar has been misused for 17 SIM cards. Verify now.',
+            timestamp: Date.now(),
+        },
+    });
+
+    const body = await response.json();
+    assert.equal(body.state, 'SUSPICIOUS');
+    assert.equal(body.reply, null, 'suspicious warns, it never baits');
+
+    const kinds = body.alerts.map((a) => a.kind);
+    assert.ok(kinds.includes('suspicious_warning'));
+    assert.ok(kinds.includes('callback_advice'));
+    assert.ok(kinds.includes('family_alert'));
+    assert.ok(body.alerts.find((a) => a.kind === 'family_alert').simulated);
+});
+
+test('the "This is genuine" button ends the engagement with one neutral line', async () => {
+    const sessionId = 'genuine-1';
+
+    const engaged = await (await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP now, your account will be blocked today.', timestamp: Date.now() },
+        metadata: { from: '+919812345678' },
+    })).json();
+    assert.equal(engaged.state, 'DECOY_ACTIVE');
+
+    const response = await post(`/api/sessions/${sessionId}/genuine`, {});
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.state, 'FALSE_POSITIVE');
+    assert.equal(body.previousState, 'DECOY_ACTIVE');
+    assert.equal(body.reply, 'Sorry, I got confused, please continue.');
+    assert.equal(body.offerTrustedContact, true, 'offers to remember the caller');
+    assert.equal(body.counterpartId, '+919812345678');
+
+    const session = await Session.findOne({ sessionId });
+    assert.equal(session.guardianState, 'FALSE_POSITIVE');
+    assert.equal(session.scamDetected, false);
+    assert.equal(session.falsePositive.markedByUser, true);
+
+    // The neutral line is in the transcript, so the report shows what was said.
+    assert.equal(session.messages[session.messages.length - 1].text, 'Sorry, I got confused, please continue.');
+});
+
+test('a session marked genuine is never baited again', async () => {
+    const sessionId = 'genuine-2';
+    await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP now, account will be blocked today.', timestamp: Date.now() },
+    });
+    await post(`/api/sessions/${sessionId}/genuine`, {});
+
+    const again = await (await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Transfer 2 lakh to account 50100234567890 immediately or you will be arrested.', timestamp: Date.now() },
+    })).json();
+
+    assert.equal(again.state, 'FALSE_POSITIVE');
+    assert.equal(again.reply, null);
+});
+
+test('marking a session genuine that does not exist is a 404', async () => {
+    const response = await post('/api/sessions/no-such-session/genuine', {});
+    assert.equal(response.status, 404);
+});
+
+test('an engagement can be ended explicitly', async () => {
+    const sessionId = 'end-1';
+    await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP now, account will be blocked today.', timestamp: Date.now() },
+    });
+
+    const body = await (await post(`/api/sessions/${sessionId}/end`, { reason: 'operator stopped it' })).json();
+    assert.equal(body.state, 'ENDED');
+
+    const session = await Session.findOne({ sessionId });
+    assert.equal(session.guardianState, 'ENDED');
+});
+
+test('the session view exposes the score, its breakdown and the label', async () => {
+    const sessionId = 'view-1';
+    await post('/api/message', {
+        sessionId,
+        message: { sender: 'scammer', text: 'Share the OTP now, your account will be blocked today.', timestamp: Date.now() },
+    });
+
+    const { session } = await (await get(`/api/sessions/${sessionId}`)).json();
+
+    assert.equal(session.state, 'DECOY_ACTIVE');
+    assert.ok(session.score >= 60);
+    assert.ok(session.scoreBreakdown.length > 0);
+    assert.ok(session.firedSignals.includes('credential_request'));
+    assert.equal(session.classifier.label, 'scam');
+    assert.ok(session.classifier.reasons.length > 0);
+    assert.ok(session.takeoverAt);
+    // No invented probability anywhere in the view.
+    assert.equal(session.confidence, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Trusted contacts
+// ---------------------------------------------------------------------------
+
+test('a trusted contact is never baited through the API', async () => {
+    const add = await post('/api/trusted-contacts', {
+        userId: 'trust-user',
+        identifier: '98765 43210',
+        label: 'my son Rahul',
+        relationship: 'family',
+    });
+    assert.equal(add.status, 201);
+    assert.equal((await add.json()).contact.identifier, '+919876543210', 'stored normalised');
+
+    const body = await (await post('/api/message', {
+        sessionId: 'trusted-1',
+        message: {
+            sender: 'scammer',
+            text: 'Maa, I need 5000 urgently. Transfer it to account 50100234567890 right now, do not tell papa.',
+            timestamp: Date.now(),
+        },
+        metadata: { userId: 'trust-user', from: '+91-98765-43210' },
+    })).json();
+
+    assert.equal(body.state, 'LEGIT');
+    assert.equal(body.reply, null, 'a saved contact is never baited');
+    assert.equal(body.guardian.trustedContact, true);
+
+    // The message did look like a scam, so the user is warned about the contact.
+    const warning = body.alerts.find((a) => a.kind === 'trusted_contact_warning');
+    assert.ok(warning, 'warns that the contact may be compromised');
+    assert.ok(warning.text.mr.length > 0);
+});
+
+test('trusted contacts can be listed and removed', async () => {
+    await post('/api/trusted-contacts', { userId: 'list-user', identifier: '9123456780', label: 'Dr. Kulkarni', relationship: 'doctor' });
+
+    const listed = await (await get('/api/trusted-contacts?userId=list-user')).json();
+    assert.equal(listed.count, 1);
+    assert.equal(listed.contacts[0].label, 'Dr. Kulkarni');
+
+    const removed = await fetch(`${baseUrl}/api/trusted-contacts/9123456780?userId=list-user`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': API_KEY },
+    });
+    assert.equal(removed.status, 200);
+
+    const after = await (await get('/api/trusted-contacts?userId=list-user')).json();
+    assert.equal(after.count, 0);
+});
+
+test('a trusted contact needs an identifier', async () => {
+    const response = await post('/api/trusted-contacts', { userId: 'bad-user', label: 'nobody' });
+    assert.equal(response.status, 400);
+});
+
+test('trusted contacts are scoped to one protected user', async () => {
+    await post('/api/trusted-contacts', { userId: 'user-a', identifier: '9000000001', label: 'A' });
+    const forB = await (await get('/api/trusted-contacts?userId=user-b')).json();
+    assert.equal(forB.count, 0, 'contacts belong to one protected user only');
 });

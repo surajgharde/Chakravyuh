@@ -65,6 +65,14 @@ const build = (raw = {}) => {
         // counted toward any engagement metric.
         replyDelayMs: toInt(raw.REPLY_DELAY_MS, 0),
 
+        // Guardian thresholds on the 0-100 rule score. A hand-off additionally
+        // requires a hard signal, which no threshold can switch off.
+        guardianThresholds: {
+            decoy: toInt(raw.GUARDIAN_DECOY_THRESHOLD, 60),
+            suspicious: toInt(raw.GUARDIAN_SUSPICIOUS_THRESHOLD, 30),
+            release: toInt(raw.GUARDIAN_RELEASE_THRESHOLD, 30),
+        },
+
         logLevel: (raw.LOG_LEVEL || 'info').trim(),
     };
 };
