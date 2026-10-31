@@ -227,15 +227,51 @@ const classifyWithLlm = async (llm, conversationText) => {
 };
 
 /**
+ * Which family of scam this looks like. Classification lives here rather than
+ * in the extractor: it is a judgement about the conversation, not an identifier
+ * found in it.
+ */
+const SCAM_TYPE_PATTERNS = {
+    digital_arrest: /\b(cbi|narcotics|ncb|arrest|warrant|fir|custody|enforcement directorate|money laundering)\b/i,
+    upi_fraud: /\b(upi|vpa|paytm|gpay|google pay|phonepe|collect request|qr code|cashback)\b/i,
+    bank_fraud: /\b(sbi|hdfc|icici|axis|kotak|bank|account|kyc|debit card|credit card|net banking|rbi)\b/i,
+    tech_support_scam: /\b(anydesk|teamviewer|quicksupport|remote access|screen shar\w*|virus|technician)\b/i,
+    investment_scam: /\b(investment|trading|profit|returns|crypto|bitcoin|usdt|portfolio|ipo)\b/i,
+    lottery_scam: /\b(lottery|lucky draw|jackpot|you have won|prize|kbc)\b/i,
+    job_scam: /\b(work from home|part time job|task based|registration fee|joining fee|placement)\b/i,
+    courier_scam: /\b(fedex|dhl|bluedart|dtdc|courier|parcel|consignment|customs)\b/i,
+    utility_scam: /\b(electricity|mseb|mahavitaran|bijli|meter|bill payment|connection will be)\b/i,
+    phishing: /\b(click|link|verify|login|update your|http)\b/i,
+};
+
+/** Picks the most specific matching scam family, or 'unknown'. */
+const classifyScamType = (text) => {
+    for (const [type, pattern] of Object.entries(SCAM_TYPE_PATTERNS)) {
+        if (pattern.test(text)) return type;
+    }
+    return 'unknown';
+};
+
+/** Identifier fields that count as a volunteered payment route. */
+const PAYMENT_ROUTE_FIELDS = ['upiIds', 'bankAccounts', 'phishingLinks', 'apkLinks', 'cryptoWallets', 'ifscCodes'];
+
+/**
  * Assesses a session.
  *
  * @param {object}   params
  * @param {string}   params.incomingText          the newest scammer-side message
  * @param {object[]} params.priorScammerMessages  earlier scammer-side messages
  * @param {object}   params.llm                   LlmClient, or null
- * @param {object}   params.extracted             output of the identifier extractor
+ * @param {object}   params.summary               the session's flat identifier lists
+ * @param {string[]} params.scriptStages          script stages seen so far
  */
-const assess = async ({ incomingText, priorScammerMessages = [], llm = null, extracted = null }) => {
+const assess = async ({
+    incomingText,
+    priorScammerMessages = [],
+    llm = null,
+    summary = null,
+    scriptStages = [],
+}) => {
     // Signals are scored over the whole scammer side: tactics build up across turns.
     const corpus = [...priorScammerMessages.map((m) => m.text), incomingText].join('\n');
 
@@ -243,8 +279,8 @@ const assess = async ({ incomingText, priorScammerMessages = [], llm = null, ext
     let score = ruleScore;
 
     // An identifier the sender volunteered is corroboration, not a tactic on its own.
-    const volunteered = Boolean(extracted
-        && (extracted.upiIds.length || extracted.bankAccounts.length || extracted.phishingLinks.length));
+    const volunteered = Boolean(summary
+        && PAYMENT_ROUTE_FIELDS.some((field) => (summary[field] || []).length > 0));
 
     if (volunteered) {
         score += WEIGHTS.volunteeredIdentifier;
@@ -284,9 +320,8 @@ const assess = async ({ incomingText, priorScammerMessages = [], llm = null, ext
         }
     }
 
-    const scamType = extracted && extracted.scamType && extracted.scamType !== 'unknown'
-        ? extracted.scamType
-        : llmVerdict.scamType;
+    const ruleScamType = classifyScamType(corpus);
+    const scamType = ruleScamType !== 'unknown' ? ruleScamType : llmVerdict.scamType;
 
     return {
         stage,
@@ -304,4 +339,15 @@ const assess = async ({ incomingText, priorScammerMessages = [], llm = null, ext
     };
 };
 
-module.exports = { assess, scoreSignals, classifyWithLlm, STAGES, SIGNALS, EXCULPATORY, THRESHOLDS, WEIGHTS };
+module.exports = {
+    assess,
+    scoreSignals,
+    classifyWithLlm,
+    classifyScamType,
+    STAGES,
+    SIGNALS,
+    EXCULPATORY,
+    THRESHOLDS,
+    WEIGHTS,
+    SCAM_TYPE_PATTERNS,
+};

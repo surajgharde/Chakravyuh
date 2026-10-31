@@ -1,7 +1,7 @@
 /**
  * One turn of the system, end to end.
  *
- *   normalize -> extract identifiers -> Guardian assessment -> (Decoy reply) -> persist
+ *   normalize -> extract entities -> tag script stages -> Guardian -> (Decoy) -> persist
  *
  * The Decoy runs only when the Guardian returns ENGAGE. On PASS or WATCH the
  * conversation is left alone and no reply is generated, which is what protects a
@@ -13,7 +13,8 @@
 const Session = require('../models/Session');
 const guardian = require('../agents/guardian');
 const decoy = require('../agents/decoy');
-const intelligence = require('./intelligence');
+const extractor = require('./extractor');
+const stages = require('./stages');
 const logger = require('./logger');
 const { normalizeMessage, normalizeHistory } = require('./normalize');
 
@@ -48,7 +49,8 @@ const loadOrCreate = async ({ sessionId, history, metadata, receivedAt }) => {
         channel: metadata.channel || 'unknown',
         language: metadata.language || 'English',
         locale: metadata.locale || 'IN',
-        messages: history.map((m) => ({
+        messages: history.map((m, index) => ({
+            messageId: `m${index + 1}`,
             role: m.role,
             text: m.text,
             ts: m.ts,
@@ -64,12 +66,21 @@ const loadOrCreate = async ({ sessionId, history, metadata, receivedAt }) => {
     return { session, created: true };
 };
 
+/** Records every script stage seen in the session, in taxonomy order. */
+const refreshScriptStages = (session) => {
+    const seen = new Set();
+    for (const message of session.messages) {
+        for (const tag of message.stages || []) seen.add(tag.stage);
+    }
+    session.scriptStages = stages.STAGES.filter((stage) => seen.has(stage));
+};
+
 /**
  * Handles one inbound message.
  *
- * @param {object} body             the request body
- * @param {object} deps             { llm }
- * @returns {Promise<object>}       the turn result
+ * @param {object} body   the request body
+ * @param {object} deps   { llm, config }
+ * @returns {Promise<object>} the turn result
  */
 const handleTurn = async (body, deps = {}) => {
     const { llm = null, config = {} } = deps;
@@ -93,30 +104,58 @@ const handleTurn = async (body, deps = {}) => {
         if (metadata.locale) session.locale = metadata.locale;
     }
 
+    // On a first contact that arrived with history, mine the back-log first so
+    // the Guardian sees everything the transcript already contains.
+    if (created && session.messages.length > 0) {
+        for (const message of session.messages) {
+            if (message.role !== 'scammer') continue;
+            extractor.mergeInto(session, extractor.extractEntities(message.text, {
+                sessionId,
+                messageId: message.messageId,
+                timestamp: message.ts ? new Date(message.ts) : message.receivedAt,
+            }));
+            message.stages = stages.tagWithRules(message.text);
+        }
+    }
+
     // Record the incoming message.
-    session.messages.push({ role: incoming.role, text: incoming.text, ts: incoming.ts, receivedAt });
+    const messageId = session.nextMessageId();
+    session.messages.push({
+        messageId,
+        role: incoming.role,
+        text: incoming.text,
+        ts: incoming.ts,
+        receivedAt,
+    });
     session.messageCount += 1;
     if (incoming.role === 'scammer') session.scammerMessageCount += 1;
     session.lastSeenAt = receivedAt;
 
-    // Identifiers, from the scammer side only.
-    const scammerMessages = session.messages.filter((m) => m.role === 'scammer');
-    const extracted = intelligence.extract(incoming.text);
-    const merged = intelligence.mergeInto(session, extracted);
+    // Entities, from the scammer side only, with full provenance.
+    const entities = incoming.role === 'scammer'
+        ? extractor.extractEntities(incoming.text, {
+            sessionId,
+            messageId,
+            timestamp: incoming.ts ? new Date(incoming.ts) : receivedAt,
+        })
+        : [];
+    const merged = extractor.mergeInto(session, entities);
 
-    // On a first contact that arrived with history, scan the back-log too.
-    if (created && history.length > 0) {
-        for (const message of history.filter((m) => m.role === 'scammer')) {
-            intelligence.mergeInto(session, intelligence.extract(message.text));
-        }
-    }
+    // Script stages for this message: rules, then one LLM call for the rest.
+    const messageStages = incoming.role === 'scammer'
+        ? await stages.tag(incoming.text, { llm })
+        : [];
+    session.messages[session.messages.length - 1].stages = messageStages;
+    refreshScriptStages(session);
 
     // Guardian.
+    const scammerMessages = session.messages.filter((m) => m.role === 'scammer');
     const assessment = await guardian.assess({
         incomingText: incoming.text,
         priorScammerMessages: scammerMessages.slice(0, -1),
         llm,
-        extracted,
+        summary: session.intelligence,
+        scriptStages: session.scriptStages,
     });
 
     session.confidence = assessment.confidence;
@@ -152,6 +191,7 @@ const handleTurn = async (body, deps = {}) => {
         });
 
         session.messages.push({
+            messageId: session.nextMessageId(),
             role: 'decoy',
             text: decoyResult.reply,
             ts: null,
@@ -184,6 +224,7 @@ const handleTurn = async (body, deps = {}) => {
             stage: assessment.stage,
             scamDetected: session.scamDetected,
             confidence: assessment.confidence,
+            ruleConfidence: assessment.ruleConfidence,
             scamType: session.scamType,
             signals: assessment.signals,
             hasHardSignal: assessment.hasHardSignal,
@@ -194,19 +235,24 @@ const handleTurn = async (body, deps = {}) => {
         decoy: decoyResult
             ? { askedFor: decoyResult.askedFor, source: decoyResult.source, violations: decoyResult.violations }
             : null,
+        scriptStages: {
+            thisMessage: messageStages,
+            session: session.scriptStages,
+        },
         measured: {
             messageCount: session.messageCount,
             scammerMessageCount: session.scammerMessageCount,
             decoyMessageCount: session.decoyMessageCount,
             engagementDurationSeconds: session.engagementDurationSeconds(),
-            newIdentifiersThisTurn: merged.identifiers,
-            newKeywordsThisTurn: merged.keywords,
+            newEntitiesThisTurn: merged.identifiers,
+            newEntityTypesThisTurn: merged.types,
             simulatedReplyDelayMs: replyDelayMs,
         },
+        entitiesThisTurn: entities,
         intelligence: session.intelligence.toObject
             ? session.intelligence.toObject()
             : session.intelligence,
     };
 };
 
-module.exports = { handleTurn, PipelineError, loadOrCreate };
+module.exports = { handleTurn, PipelineError, loadOrCreate, refreshScriptStages };
