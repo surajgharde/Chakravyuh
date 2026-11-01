@@ -19,3 +19,8 @@ npm-debug.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# Third-party bundles fetched by `npm run vendor` so the console works
+# offline. Not committed: someone else's minified output does not belong
+# in this history, and re-downloading is cheaper than carrying 2 MB of it.
+src/public/vendor/

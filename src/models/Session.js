@@ -93,6 +93,27 @@ const GuardianLogEntrySchema = new mongoose.Schema({
     decisionMs: { type: Number, default: 0 },
 }, { _id: false });
 
+/**
+ * One decoy draft the output guard refused to send.
+ *
+ * Kept per block, not per turn: a turn can produce two blocked drafts before
+ * the decoy gives up and says a scripted line, and both are worth seeing.
+ *
+ * `redactedDraft` is the draft with every digit masked and every link and
+ * handle removed. The draft was blocked because of what was in it, so storing
+ * it verbatim would move the leak from the wire into the database and from
+ * there into any exported report. What is kept shows the shape of the mistake
+ * without carrying the dangerous part.
+ */
+const GuardBlockSchema = new mongoose.Schema({
+    at: { type: Date, default: Date.now },
+    messageId: { type: String, default: null },
+    attempt: { type: Number, default: 1 },
+    ruleIds: { type: [String], default: [] },
+    reasons: { type: [String], default: [] },
+    redactedDraft: { type: String, default: '' },
+}, { _id: false });
+
 /** One fact the persona has claimed, and when she claimed it. */
 const LedgerEntrySchema = new mongoose.Schema({
     slot: { type: String, required: true },
@@ -149,6 +170,10 @@ const SessionSchema = new mongoose.Schema({
 
     // Every scored message, in order. The evidence report prints this.
     guardianLog: { type: [GuardianLogEntrySchema], default: [] },
+
+    // Every decoy draft the output guard refused to send, with the rule it
+    // broke. This is the record of what the system declined to say.
+    guardLog: { type: [GuardBlockSchema], default: [] },
 
     // Set when the protected user pressed "This is genuine".
     falsePositive: {

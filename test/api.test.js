@@ -89,9 +89,22 @@ test.after(async () => {
 test('health needs no key and reports what is wired up', async () => {
     const response = await get('/health', {});
     assert.equal(response.status, 200);
+
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.llmConfigured, true);
+    assert.equal(body.llm.configured, true);
+
+    // It reports the live connection state rather than echoing the config,
+    // because a deploy health check needs to know whether a request would
+    // actually succeed.
+    assert.equal(body.db.ready, true);
+    assert.equal(body.db.state, 'connected');
+
+    // A scripted reply must never be mistaken for a model reply, including by
+    // an operator reading a health check.
+    assert.equal(body.llm.scripted, false);
+    assert.ok(typeof body.uptimeSeconds === 'number');
+    assert.ok(typeof body.version === 'string');
 });
 
 test('the message endpoint rejects a request with no key', async () => {

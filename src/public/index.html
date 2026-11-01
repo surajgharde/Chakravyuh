@@ -5,31 +5,77 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chakravyuh</title>
 
-<!-- Tailwind's play CDN. No build step, by design: this page has to run from a
-     clone with nothing but `npm start`. -->
-<script src="https://cdn.tailwindcss.com"></script>
+<!-- Third-party scripts, loaded offline-first.
+     ================================================================
+     No build step, by design: this page has to run from a clone with nothing
+     but `npm start`. But a demo runs on conference Wi-Fi, and FAKE_LLM=1
+     having taken the model off the critical path counts for little if the
+     page then renders unstyled because a CDN was unreachable.
+
+     So each script is tried from src/public/vendor/ first and falls back to
+     its CDN. `npm run vendor` fills that directory; skip it and the behaviour
+     is exactly what it was before. Loaded synchronously via document.write
+     because Tailwind's JIT must run before the body is parsed - deferring it
+     produces a visible flash of unstyled content. -->
 <script>
-  tailwind.config = {
-    theme: {
-      extend: {
-        colors: {
-          ink: '#141413', paper: '#faf9f7', line: '#e4e0d9',
-          muted: '#6b6760', brick: '#8c3b1e', moss: '#1f6f43', amber: '#b4690e',
-        },
-        fontFamily: {
-          sans: ['Segoe UI', 'system-ui', '-apple-system', 'sans-serif'],
-          mono: ['Cascadia Mono', 'Consolas', 'monospace'],
+  (function loadVendored() {
+    var assets = [
+      { local: 'vendor/tailwind.js', cdn: 'https://cdn.tailwindcss.com' },
+      {
+        local: 'vendor/vis-network.min.js',
+        cdn: 'https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js',
+      },
+    ];
+
+    // A synchronous HEAD is the only way to know whether the vendored copy
+    // exists before committing to a synchronous <script> tag. It is one
+    // same-origin request against our own static handler, at page load, on a
+    // local demo tool - the cost is a millisecond and the alternative is the
+    // flash of unstyled content this whole block exists to avoid.
+    function hasLocal(url) {
+      try {
+        var probe = new XMLHttpRequest();
+        probe.open('HEAD', url, false);
+        probe.send();
+        return probe.status === 200;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    for (var i = 0; i < assets.length; i += 1) {
+      var src = hasLocal(assets[i].local) ? assets[i].local : assets[i].cdn;
+      document.write('<script src="' + src + '"><\/script>');
+    }
+  }());
+</script>
+
+<script>
+  // Guarded: when both the vendored copy and the CDN are unreachable,
+  // `tailwind` is undefined and an unguarded assignment here throws a
+  // ReferenceError that aborts the rest of this block. The page is then
+  // unstyled AND broken rather than merely unstyled. The banner further down
+  // is what tells the operator which of the two happened.
+  if (typeof tailwind !== 'undefined') {
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink: '#141413', paper: '#faf9f7', line: '#e4e0d9',
+            muted: '#6b6760', brick: '#8c3b1e', moss: '#1f6f43', amber: '#b4690e',
+          },
+          fontFamily: {
+            sans: ['Segoe UI', 'system-ui', '-apple-system', 'sans-serif'],
+            mono: ['Cascadia Mono', 'Consolas', 'monospace'],
+          },
         },
       },
-    },
-  };
+    };
+  }
 </script>
 
 <!-- Socket.IO client, served by our own server rather than a CDN. -->
 <script src="/socket.io/socket.io.js"></script>
-
-<!-- vis-network, for the identifier graph. -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js"></script>
 
 <link rel="stylesheet" href="styles.css">
 </head>
@@ -57,6 +103,11 @@
     <span id="call-badge"
           class="hidden text-[11px] font-semibold px-2 py-1 rounded border border-brick text-brick bg-brick/5">
       &#9679; SIMULATED CALL &mdash; laptop mic, no telephony
+    </span>
+    <span id="fake-llm-badge"
+          class="hidden text-[11px] font-semibold px-2 py-1 rounded border border-amber text-amber bg-amber/10"
+          title="FAKE_LLM=1. Every reply comes from a script in src/llm/fakeTransport.js with no network. Nothing here is model-generated.">
+      SCRIPTED REPLIES &mdash; FAKE_LLM
     </span>
     <span id="llm-badge" class="hidden text-[11px] px-2 py-1 rounded border border-amber text-amber bg-amber/5"></span>
     <span id="demo-badge" class="hidden text-[11px] px-2 py-1 rounded border border-line text-muted">DEMO_MODE</span>
@@ -314,11 +365,42 @@
           <div id="decoy-flags" class="mt-1.5 flex flex-wrap gap-1"></div>
         </div>
 
+        <!-- what the output guard refused to send -->
+        <div class="p-2.5 border-b border-line">
+          <div class="flex items-baseline justify-between mb-1.5">
+            <span class="text-[10px] uppercase tracking-wider text-muted font-semibold">
+              Output guard &mdash; blocked replies
+            </span>
+            <span id="guard-count" class="text-[10px] text-muted">0</span>
+          </div>
+          <div id="guard-blocks" class="space-y-1">
+            <div class="text-[11px] text-muted italic">Nothing blocked. Every reply passed.</div>
+          </div>
+        </div>
+
         <!-- guardian decisions -->
-        <div class="p-2.5">
+        <div class="p-2.5 border-b border-line">
           <div class="text-[10px] uppercase tracking-wider text-muted font-semibold mb-1.5">Guardian decisions</div>
           <div id="decisions" class="space-y-1 font-mono text-[10px]">
             <div class="text-[11px] text-muted italic font-sans">Nothing yet.</div>
+          </div>
+        </div>
+
+        <!-- the standing limits, always on screen rather than only in a file -->
+        <div class="p-2.5">
+          <div class="flex items-baseline justify-between mb-1.5">
+            <span class="text-[10px] uppercase tracking-wider text-muted font-semibold">
+              What our agents never do
+            </span>
+            <button id="btn-ethics" type="button"
+                    class="text-[10px] text-brick underline hover:no-underline">
+              ETHICS.md
+            </button>
+          </div>
+          <ol id="never-list" class="space-y-0.5"></ol>
+          <div class="mt-1.5 text-[9.5px] text-muted leading-snug">
+            Each one is a rule in the output guard or the Guardian, not a line in a prompt.
+            A blocked reply is listed above with the rule it broke.
           </div>
         </div>
       </div>
@@ -353,6 +435,66 @@
   </div>
 </div>
 
+<!-- ===================== ethics modal ===================== -->
+<div id="ethics-modal" class="hidden fixed inset-0 z-40 bg-ink/50 p-6">
+  <div class="bg-white rounded-lg h-full max-w-3xl mx-auto flex flex-col overflow-hidden border border-line">
+    <div class="h-11 shrink-0 px-4 flex items-center gap-3 border-b border-line">
+      <span class="font-bold text-[14px]">What our agents never do</span>
+      <span class="text-[11px] text-muted">the full text is ETHICS.md in the repo</span>
+      <button id="btn-ethics-close" class="ml-auto text-[12px] px-2.5 py-1 rounded border border-line hover:bg-paper">
+        Close
+      </button>
+    </div>
+    <div class="flex-1 overflow-y-auto p-5 text-[12.5px] leading-relaxed">
+      <ol id="ethics-list" class="space-y-2.5"></ol>
+
+      <div class="mt-5 pt-4 border-t border-line space-y-3">
+        <div>
+          <div class="font-semibold text-[12px]">You can take back control at any moment</div>
+          <p class="text-muted mt-0.5">
+            The button on the phone &mdash; <strong>&ldquo;This is genuine &mdash; stop&rdquo;</strong> &mdash;
+            ends the engagement immediately, mid-turn, with no confirmation step. It sends one
+            neutral line so the thread does not stop dead, marks the session a false positive
+            (which is terminal &mdash; no later message re-escalates it), and offers to add the
+            caller to the trusted list so they are never baited again.
+          </p>
+        </div>
+
+        <div>
+          <div class="font-semibold text-[12px]">False positives</div>
+          <p class="text-muted mt-0.5">
+            Baiting a real caller is the worst thing this system could do, so a hand-off needs a
+            hard signal and not just a high score; <code>SUSPICIOUS</code> warns and never baits;
+            a <code>legit</code> label caps the state; and a trusted contact is never engaged
+            whatever the score. The rate is measured and printed by the test suite, which fails
+            if one legitimate message out of twenty reaches the decoy.
+          </p>
+        </div>
+
+        <div>
+          <div class="font-semibold text-[12px]">Data retention</div>
+          <p class="text-muted mt-0.5">
+            Sessions are deleted <strong id="ethics-retention">30</strong> days after they were
+            last seen, by a sweep that runs at boot and every six hours. The window is
+            configurable with <code>SESSION_RETENTION_DAYS</code>; setting it to <code>0</code>
+            keeps sessions indefinitely and logs a warning on every boot. A report never contains
+            the protected user's real name, number or address.
+          </p>
+        </div>
+
+        <div>
+          <div class="font-semibold text-[12px]">Nothing is filed automatically</div>
+          <p class="text-muted mt-0.5">
+            No report is submitted to 1930, cybercrime.gov.in or anywhere else. There is no
+            outbound path in the codebase. A report stays a draft until a family member has read
+            it, and filing it is their decision.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ===================== report modal ===================== -->
 <div id="report-modal" class="hidden fixed inset-0 z-40 bg-ink/50 p-6">
   <div class="bg-white rounded-lg h-full flex flex-col overflow-hidden border border-line">
@@ -373,6 +515,41 @@
 
 <!-- ===================== toasts ===================== -->
 <div id="toasts" class="fixed bottom-4 right-4 z-50 space-y-2 w-80"></div>
+
+<!-- Offline-asset banner.
+     ================================================================
+     Shown only when a third-party script reached neither the vendored copy
+     nor its CDN. Without it the failure is silent in exactly the way that
+     costs the most: the operator sees an unstyled page or a blank graph
+     panel seconds before a demo and has no idea which of the two broke, or
+     that the fix is one command. Styled inline because the missing script may
+     be the one that provides the styling. -->
+<div id="offline-assets"
+     style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;
+            padding:10px 16px;font:13px/1.5 'Segoe UI',system-ui,sans-serif;
+            background:#b4690e;color:#fff">
+  <strong>Offline:</strong>
+  <span id="offline-assets-list"></span>
+  could not be loaded from the CDN and no local copy is vendored.
+  The system itself is unaffected &mdash; detection, the decoy and the reports
+  all run on this server. Run <code style="background:rgba(0,0,0,.2);padding:1px 5px;
+  border-radius:3px">npm run vendor</code> once while online to make the console
+  work with no network at all.
+</div>
+
+<script>
+  // Runs after the two third-party tags above have either loaded or failed.
+  (function reportMissingAssets() {
+    var missing = [];
+    if (typeof tailwind === 'undefined') missing.push('the stylesheet engine');
+    if (typeof vis === 'undefined') missing.push('the network graph library');
+    if (missing.length === 0) return;
+
+    var banner = document.getElementById('offline-assets');
+    document.getElementById('offline-assets-list').textContent = missing.join(' and ');
+    banner.style.display = 'block';
+  }());
+</script>
 
 <script src="voice.js"></script>
 <script src="app.js"></script>

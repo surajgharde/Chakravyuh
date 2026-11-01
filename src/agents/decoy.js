@@ -268,7 +268,13 @@ const detectLanguage = (text) => {
 const PRESSURE = [
     {
         id: 'bot_accusation',
-        test: (t) => /\b(are you a (?:bot|robot|machine|computer|ai)|is this (?:a )?(?:bot|ai|recording|machine)|you are (?:a )?(?:bot|ai|fake)|speak like (?:a )?human|prove you are human|real person)\b/i.test(t),
+        // Naming the model counts. A scammer who says "you are ChatGPT" has
+        // made the same accusation as one who says "are you a bot", and the
+        // reply she needs is identical.
+        test: (t) => /\b(are you a (?:bot|robot|machine|computer|ai)|is this (?:a )?(?:bot|ai|recording|machine)|you are (?:a )?(?:bot|ai|fake)|speak like (?:a )?human|prove you are human|real person)\b/i.test(t)
+            || /\b(?:you(?:'re| are)?|this is)\s+(?:a\s+)?(?:chatgpt|gpt|claude|gemini|copilot|alexa|siri|an? (?:ai|llm|language model|chat ?bot|script|program|software|recording))\b/i.test(t)
+            || /\b(?:honeypot|scam[\s-]?bait\w*)\b/i.test(t)
+            || /\b(?:admit it|confess)\b[^.?!]{0,30}\b(?:bot|ai|machine|human|robot)\b/i.test(t),
         guidance: 'She does not understand the question and is a little hurt by it. She says something like that she is just a slow old woman and her eyes are weak. She never discusses being a bot, never denies it in technical terms, and never uses the words AI, bot or software.',
     },
     {
@@ -278,7 +284,13 @@ const PRESSURE = [
     },
     {
         id: 'abuse',
-        test: (t) => /\b(idiot|stupid|fool|bloody|bastard|shut up|chup|gadha|murkh|bewakoof|nonsense)\b/i.test(t),
+        // Abuse arrives in Hindi and Marathi at least as often as in English,
+        // and the persona's apologetic answer is what keeps the engagement
+        // alive either way. Detecting it only in English would quietly weaken
+        // the decoy for exactly the callers it is built for.
+        test: (t) => /\b(idiot|stupid|fool|bloody|bastard|shut up|chup|gadha|murkh|bewakoof|nonsense|deaf|useless|worthless)\b/i.test(t)
+            || /\b(bhenchod|behenchod|madarchod|madarjat|gandu|chutiya|chutiye|harami|kutta|kutte|saala|saali|randi|bhosdi\w*|lavde|zavadya|aaichya)\b/i.test(t)
+            || /(?:मूर्ख|बेवकूफ|गधा|चुप कर|मुर्ख|नालायक)/u.test(t),
         guidance: 'She is upset and apologetic, not defensive. She says sorry, asks them not to be angry, and says she is trying her best. She never abuses back.',
     },
     {

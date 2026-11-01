@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 /**
+ * Everything a demo needs in the database before the first message is sent:
+ * trusted contacts, five past sessions for the network view, and a printed
+ * list of the scenario openers a judge will use.
+ *
  * Seeds five past sessions so the network view has something in it during a
  * demo.
  *
@@ -13,7 +17,8 @@
  *   - the UPI id  cyber.verify@okaxis  appears in sessions 1 and 3
  *   - the phone   +919812345678        appears in sessions 2 and 5
  *
- * Usage:  npm run seed
+ * Usage:  npm run seed     seed only
+ *         npm run demo     seed, then start the server
  */
 
 require('dotenv').config();
@@ -25,6 +30,7 @@ const extractor = require('../src/services/extractor');
 const stages = require('../src/services/stages');
 const guardian = require('../src/agents/guardian');
 const intelligence = require('../src/agents/intelligence');
+const trustedContacts = require('../src/services/trustedContacts');
 const logger = require('../src/services/logger');
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -125,6 +131,48 @@ const SEEDS = [
     },
 ];
 
+/**
+ * The protected user's trusted contacts.
+ *
+ * These matter to the demo more than they look. Step 1 of DEMO.md is a message
+ * from the user's son passing through untouched, and the number it comes from
+ * is the first one below. Without it seeded, the son's message is still not
+ * baited - it scores 5, nowhere near the threshold - but it is not baited for
+ * the boring reason. With it seeded, the Guardian can be shown declining on the
+ * strong reason too: a vouched-for caller is never engaged, whatever the
+ * content scores.
+ *
+ * The bank helpline is the interesting one. A real bank's number sending a real
+ * OTP alert is the message a keyword matcher gets most wrong.
+ */
+const TRUSTED = [
+    { userId: 'demo-user', identifier: '+919876500001', label: 'Rahul (son, Bengaluru)', relationship: 'family' },
+    { userId: 'demo-user', identifier: '+919876500002', label: 'Dr. Kulkarni, Sahyadri Clinic', relationship: 'doctor' },
+    { userId: 'demo-user', identifier: '1800112211', label: 'SBI helpline (printed on her card)', relationship: 'bank' },
+    { userId: 'demo-user', identifier: '+919876500003', label: 'Neighbour, Mrs Joshi', relationship: 'other' },
+    { userId: 'demo-user-2', identifier: '+919876500011', label: 'Daughter, Pune', relationship: 'family' },
+];
+
+/** Seeds the trusted contacts, replacing any already on file. */
+const seedTrustedContacts = async () => {
+    const seeded = [];
+
+    for (const contact of TRUSTED) {
+        // add() upserts and normalises the identifier, so this goes through the
+        // same path the console's "add to trusted contacts" button uses rather
+        // than writing the collection directly.
+        const saved = await trustedContacts.add(contact.userId, {
+            identifier: contact.identifier,
+            label: contact.label,
+            relationship: contact.relationship,
+            addedFrom: 'manual',
+        });
+        seeded.push({ userId: contact.userId, ...saved.toObject() });
+    }
+
+    return seeded;
+};
+
 /** Builds one session document by running the real extractor over the transcript. */
 const buildSession = async (seed) => {
     const startedAt = new Date(Date.now() - seed.daysAgo * DAY);
@@ -220,7 +268,7 @@ const buildSession = async (seed) => {
     return session;
 };
 
-const run = async () => {
+const run = async ({ keepConnection = false } = {}) => {
     let config;
     try {
         config = load();
@@ -234,9 +282,23 @@ const run = async () => {
 
     await db.connect(config);
 
+    // --- trusted contacts -------------------------------------------------
+
+    const contacts = await seedTrustedContacts();
+
+    console.log('\n  TRUSTED CONTACTS  (never baited, whatever a message scores)\n');
+    for (const contact of contacts) {
+        console.log(`  ${contact.identifier.padEnd(16)} ${contact.relationship.padEnd(8)} `
+            + `${contact.label}  [${contact.userId}]`);
+    }
+
+    // --- past sessions ----------------------------------------------------
+
     const ids = SEEDS.map((s) => s.sessionId);
     const removed = await Session.deleteMany({ sessionId: { $in: ids } });
     if (removed.deletedCount > 0) logger.info(`Replaced ${removed.deletedCount} existing seeded session(s).`);
+
+    console.log('\n  PAST SESSIONS  (synthetic; every one carries seeded: true)\n');
 
     for (const seed of SEEDS) {
         const session = await buildSession(seed);
@@ -246,8 +308,11 @@ const run = async () => {
         const found = ['upiIds', 'bankAccounts', 'phoneNumbers', 'ifscCodes']
             .flatMap((field) => intel[field] || []);
 
-        console.log(`  ${seed.sessionId.padEnd(30)} ${String(session.score).padStart(3)}  ${session.scamType.padEnd(18)} ${found.length} identifier(s)`);
+        console.log(`  ${seed.sessionId.padEnd(30)} ${String(session.score).padStart(3)}  `
+            + `${session.scamType.padEnd(18)} ${found.length} identifier(s)`);
     }
+
+    // --- the network the graph will draw ----------------------------------
 
     const network = require('../src/services/network');
     const graph = await network.build();
@@ -262,8 +327,45 @@ const run = async () => {
         }
     }
 
+    // --- the openers a judge will use -------------------------------------
+    //
+    // Printed from the route module rather than retyped here, so this list and
+    // the console's scenario buttons cannot drift apart.
+
+    const { SCENARIOS } = require('../src/routes/api');
+
+    console.log('\n  SCENARIO OPENERS  (the console\'s buttons; same list, same text)\n');
+    for (const scenario of SCENARIOS) {
+        const kind = scenario.kind === 'scam' ? 'SCAM' : 'LEGIT';
+        console.log(`  [${kind}] ${scenario.label}  (${scenario.channel}, ${scenario.language}, from ${scenario.from})`);
+        console.log(`         "${scenario.opening.slice(0, 96)}${scenario.opening.length > 96 ? '...' : ''}"`);
+        if ((scenario.followUps || []).length > 0) {
+            console.log(`         + ${scenario.followUps.length} scripted follow-up(s)`);
+        }
+    }
+
+    // --- what to do next --------------------------------------------------
+
+    console.log('\n  READY.');
+    console.log(`  Console   http://localhost:${config.port}`);
+    console.log(`  Health    http://localhost:${config.port}/health`);
+    console.log('  Script    docs/DEMO.md  (3-minute judge walkthrough)');
+
+    if (config.fakeLlm) {
+        console.log('\n  FAKE_LLM=1: replies are scripted, with no network. The console badges this.');
+    } else if (!config.llm.apiKey) {
+        console.log('\n  No LLM_API_KEY: the Guardian runs on rules only and the decoy on scripted');
+        console.log('  fallback lines. For a demo without a key, prefer FAKE_LLM=1 - the replies');
+        console.log('  are written for it and do not repeat inside six turns.');
+    }
+
     console.log('');
-    await db.disconnect();
+
+    // npm run demo starts the server in this same process afterwards, so the
+    // connection is handed over rather than torn down and rebuilt.
+    if (!keepConnection) await db.disconnect();
+
+    return { contacts, sessions: SEEDS.length, graph };
 };
 
 if (require.main === module) {
@@ -273,4 +375,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { SEEDS, buildSession };
+module.exports = { SEEDS, TRUSTED, buildSession, seedTrustedContacts, run };

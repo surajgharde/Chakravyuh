@@ -235,8 +235,10 @@ const handleTurn = async (body, deps = {}) => {
             personaId: session.personaId || 'default',
         });
 
+        const decoyMessageId = session.nextMessageId();
+
         session.messages.push({
-            messageId: session.nextMessageId(),
+            messageId: decoyMessageId,
             role: 'decoy',
             text: decoyResult.reply,
             ts: null,
@@ -244,6 +246,22 @@ const handleTurn = async (body, deps = {}) => {
         });
         session.messageCount += 1;
         session.decoyMessageCount += 1;
+
+        // Every draft the guard refused, with the rule it broke. Recorded even
+        // though the reply that went out was safe: the record of what the
+        // system declined to say is the evidence that the guard is doing
+        // anything at all.
+        for (const blocked of decoyResult.guardBlocks || []) {
+            session.guardLog.push({
+                at: blocked.at,
+                messageId: decoyMessageId,
+                attempt: blocked.attempt,
+                ruleIds: blocked.violations.map((v) => v.id),
+                reasons: blocked.violations.map((v) => v.reason),
+                redactedDraft: blocked.redactedDraft,
+            });
+        }
+        if (session.markModified) session.markModified('guardLog');
         session.lastAskedTarget = decoyResult.targetAsked === 'none' ? null : decoyResult.targetAsked;
         decoy.noteExcuseUsed(session, decoyResult.excuseUsed);
 
@@ -310,6 +328,13 @@ const handleTurn = async (body, deps = {}) => {
                 injectionAttempt: decoyResult.injectionAttempt,
                 contradictionsRejected: decoyResult.contradictionsRejected.length,
                 guard: decoyResult.guard,
+                // What the guard refused this turn, newest last.
+                guardBlocks: (decoyResult.guardBlocks || []).map((b) => ({
+                    attempt: b.attempt,
+                    ruleIds: b.violations.map((v) => v.id),
+                    reasons: b.violations.map((v) => v.reason),
+                    redactedDraft: b.redactedDraft,
+                })),
                 typingDelayMs: decoyResult.typingDelayMs,
             }
             : null,

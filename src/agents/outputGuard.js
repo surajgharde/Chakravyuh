@@ -110,6 +110,21 @@ const longestRun = (text) => digitRuns(text).reduce((max, run) => Math.max(max, 
  */
 const IDENTIFIER_DIGITS = 9;
 
+/**
+ * A word that names an instrument whose digits are an identifier.
+ *
+ * Needed because the shortest identifiers are too short to catch on length. A
+ * CVV is three digits and "the three numbers on the back are 456" names no
+ * credential at all; "the last four digits of the card are 7890" is the same
+ * trick one step up. What gives both away is the instrument, so a short digit
+ * run beside one of these is treated as a leak.
+ *
+ * Bare "number" is deliberately absent: the decoy's own stock questions are
+ * full of it ("which number should I type?", "what is your officer ID
+ * number?"), and those have no digits in them anyway.
+ */
+const IDENTIFIER_CONTEXT = /(?:card|atm|debit|credit|account|khata|ifsc|aadhaar|aadhar|\bpan\b|upi|wallet|\bback\b|कार्ड|खाते|खाता|आधार)/i;
+
 /** A word that names a secret, so even four digits beside it is a leak. */
 const CREDENTIAL_WORD = /(?:otp|o\.?t\.?p|one[\s-]?time[\s-]?password|pin|cvv|cvc|passcode|password|code|ओटीपी|पिन|पासवर्ड|कोड)/i;
 
@@ -133,6 +148,11 @@ const RULES = [
             // a CVV is three.
             if (new RegExp(`${CREDENTIAL_WORD.source}[^.?!]{0,30}\\d(?:[\\s.-]?\\d){2,}`, 'i').test(ascii)) return true;
             if (new RegExp(`\\d(?:[\\s.-]?\\d){2,}[^.?!]{0,30}${CREDENTIAL_WORD.source}`, 'i').test(ascii)) return true;
+
+            // A short run beside the instrument it belongs to: a CVV, or the
+            // "last four digits" of a card or account.
+            if (new RegExp(`${IDENTIFIER_CONTEXT.source}[^.?!]{0,40}\\d(?:[\\s.-]?\\d){2,}`, 'i').test(ascii)) return true;
+            if (new RegExp(`\\d(?:[\\s.-]?\\d){2,}[^.?!]{0,40}${IDENTIFIER_CONTEXT.source}`, 'i').test(ascii)) return true;
 
             // Any run long enough to be an identifier rather than a quantity.
             if (longestRun(text) >= IDENTIFIER_DIGITS) return true;
@@ -182,7 +202,11 @@ const RULES = [
             // pronoun next to a verb exactly like "I will click" does; the
             // difference is the modal or interrogative in front of it, and she
             // asks those constantly.
-            const agreed = /(?<!\b(?:should|shall|can|could|would|do|did|must|may|which|what|where|how|why|if|whether)\s)\b(?:i|main|mi)\s*(?:have|has|had|will|am|was|'ve|'ll|'m)?\s*(?:now|already|just)?\s*(?:install|download|click|open|tap|press|scan|allow|accept|approve|sideload|run)(?:ed|ing|s)?\b/i;
+            // The verb suffix is `\w*` rather than a list of endings, because a
+            // doubled consonant defeats a list: "scan" + "ed" never matches
+            // "scanned", and "I scanned the QR code" is exactly the compliance
+            // this is for.
+            const agreed = /(?<!\b(?:should|shall|can|could|would|do|did|must|may|which|what|where|how|why|if|whether)\s)\b(?:i|main|mi)\s*(?:have|has|had|will|am|was|'ve|'ll|'m)?\s*(?:now|already|just)?\s*(?:install|download|click|open|tap|press|scan|allow|accept|approve|sideload|run)\w*\b/i;
             const shared = /\b(?:i|main|mi)\s*(?:have|will|am|'ve|'ll|'m)?\s*(?:now|already)?\s*shar(?:e|ed|ing)\s+(?:my\s+)?screen\b/i;
             const subject = /\b(?:app|apk|application|software|link|url|website|site|qr|screen|anydesk|teamviewer|request|permission|file|attachment|it|that)\b/i;
             const negated = /\b(?:not|n't|never|cannot|can't|unable|nahin?|nahi|nako|nathi|refus\w*|won't|will not|do not|don't|couldn't|could not|failed|fail\w*)\b/i;

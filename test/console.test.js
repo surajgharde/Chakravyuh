@@ -109,7 +109,16 @@ test('Tailwind and vis-network come from a CDN, Socket.IO comes from our own ser
 });
 
 test('the page pulls in nothing else from the network', () => {
-    const external = [...html.matchAll(/(?:src|href)="(https?:\/\/[^"]+)"/g)].map((m) => m[1]);
+    /**
+     * Every absolute URL in the file, not only the ones in a src= or href=
+     * attribute.
+     *
+     * The attribute-only form of this test quietly stopped guarding anything
+     * the moment the two CDN URLs moved into the offline-first loader's
+     * JavaScript: it matched zero URLs and passed vacuously. A test that
+     * cannot fail is worse than no test, because it reads as coverage.
+     */
+    const external = [...html.matchAll(/https?:\/\/[^"'\s)]+/g)].map((m) => m[0]);
     const allowed = ['https://cdn.tailwindcss.com', 'https://cdnjs.cloudflare.com'];
 
     for (const url of external) {
@@ -118,6 +127,29 @@ test('the page pulls in nothing else from the network', () => {
             `unexpected external resource: ${url}`
         );
     }
+
+    // And the allowlist is only reachable as a fallback: both have a local
+    // copy tried first, so `npm run vendor` makes the page fully offline.
+    assert.equal(external.length, 2, 'expected exactly the two fallback CDN URLs');
+});
+
+test('each third-party script is tried from disk before its CDN', () => {
+    for (const local of ['vendor/tailwind.js', 'vendor/vis-network.min.js']) {
+        assert.ok(html.includes(local), `${local} is never attempted locally`);
+    }
+    assert.ok(html.includes("probe.open('HEAD'"), 'nothing checks whether the local copy exists');
+});
+
+test('a missing stylesheet engine cannot throw and cannot pass unnoticed', () => {
+    // tailwind.config is assigned only behind a typeof guard: unguarded, the
+    // CDN being blocked turns an unstyled page into a broken one.
+    assert.ok(
+        html.includes("typeof tailwind !== 'undefined'"),
+        'tailwind.config is assigned without checking that tailwind loaded'
+    );
+    // And the operator is told, rather than left guessing at an unstyled page.
+    assert.ok(html.includes('id="offline-assets"'), 'there is no offline banner');
+    assert.ok(html.includes('npm run vendor'), 'the banner never says how to fix it');
 });
 
 // ---------------------------------------------------------------------------
@@ -228,5 +260,103 @@ test('the bootstrap is served only to loopback', () => {
 test('the console files nothing and submits nothing', () => {
     for (const forbidden of ['cybercrime.gov.in/api', 'submitComplaint', 'autoSubmit']) {
         assert.ok(!js.includes(forbidden), `app.js references ${forbidden}`);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// The output guard, and the limits shown on screen
+// ---------------------------------------------------------------------------
+
+test('the blocked-replies panel is on the page', () => {
+    for (const id of ['guard-blocks', 'guard-count']) {
+        assert.ok(htmlIds.has(id), `the intelligence panel is missing ${id}`);
+    }
+    assert.ok(css.includes('.guard-block'), 'a blocked reply has no styling');
+    assert.ok(js.includes('addGuardBlocks'), 'nothing renders a blocked reply');
+});
+
+test('a blocked reply is appended rather than replacing the last one', () => {
+    // A block is an event. Rebuilding the panel per turn would make a reply
+    // caught two turns ago vanish, and the record of what the system refused
+    // to say is the whole reason for showing it.
+    assert.ok(js.includes('state.guardBlockCount'), 'blocks are not counted across the session');
+
+    // The panel is only ever cleared to remove the "Nothing blocked"
+    // placeholder, never to make room for the current turn. An unguarded
+    // innerHTML reset inside addGuardBlocks would drop earlier blocks.
+    // Bounded to the renderer: "// The clock" also appears earlier in the
+    // file, so the end of the slice has to be searched for from the start of
+    // the function rather than from the top.
+    const start = js.indexOf('const addGuardBlocks');
+    const render = js.slice(start, js.indexOf('// The clock', start));
+    const clears = [...render.matchAll(/el\.guardBlocks\.innerHTML\s*=/g)].length;
+    assert.equal(clears, 1, `expected one guarded clear, found ${clears}`);
+    assert.ok(/if \(el\.guardBlocks\.querySelector\('\.italic'\)\) el\.guardBlocks\.innerHTML = ''/.test(render),
+        'the clear is not conditional on the placeholder still being there');
+});
+
+test('the never-do list is shown on screen, not only in ETHICS.md', () => {
+    assert.ok(htmlIds.has('never-list'), 'the standing limits are not on the page');
+    assert.ok(html.includes('What our agents never do'), 'the panel has no heading');
+    assert.ok(js.includes('const NEVER_DO'), 'the list is not defined');
+});
+
+test('the never-do list has all nine items the brief names', () => {
+    const list = js.slice(js.indexOf('const NEVER_DO'), js.indexOf('GUARD_RULE_LABELS'));
+    const items = [...list.matchAll(/short: '/g)].length + [...list.matchAll(/short: "/g)].length;
+    assert.equal(items, 9, `expected nine standing limits, found ${items}`);
+
+    for (const promise of [
+        'move money', 'share identifiers', 'click links or install',
+        'impersonate', 'threaten or harass', 'outside the thread',
+        'bait a trusted contact', 'without human review', 'personal data in a report',
+    ]) {
+        assert.ok(new RegExp(promise, 'i').test(list), `the list is missing "${promise}"`);
+    }
+});
+
+test('each promise says where it is enforced', () => {
+    const list = js.slice(js.indexOf('const NEVER_DO'), js.indexOf('GUARD_RULE_LABELS'));
+    const rules = [...list.matchAll(/rule: /g)].length;
+    assert.equal(rules, 9, 'a promise with no named enforcement point is just a promise');
+});
+
+test('the ethics panel covers the false-positive path, retention and taking back control', () => {
+    assert.ok(htmlIds.has('ethics-modal'));
+    assert.ok(htmlIds.has('ethics-retention'), 'the retention window is not shown');
+    assert.ok(js.includes('config.sessionRetentionDays'),
+        'the page hard-codes a retention window instead of reading the real one');
+
+    for (const topic of [
+        /take back control/i,
+        /false positive/i,
+        /retention/i,
+        /SESSION_RETENTION_DAYS/,
+        /nothing is filed automatically/i,
+    ]) {
+        assert.ok(topic.test(html), `the ethics panel does not cover ${topic}`);
+    }
+});
+
+test('ETHICS.md exists and matches what the console promises', () => {
+    const ethics = fs.readFileSync(path.join(__dirname, '..', 'ETHICS.md'), 'utf8');
+
+    for (const section of [
+        /what our agents never do/i,
+        /false positive/i,
+        /data retention/i,
+        /taking back control/i,
+    ]) {
+        assert.ok(section.test(ethics), `ETHICS.md has no section on ${section}`);
+    }
+
+    // The nine promises are numbered in the table.
+    for (const promise of [
+        /move money/i, /share identifiers/i, /click links or install/i,
+        /impersonate officials/i, /threaten or harass/i,
+        /outside the existing thread/i, /bait a trusted contact/i,
+        /without human review/i, /personal data in a report/i,
+    ]) {
+        assert.ok(promise.test(ethics), `ETHICS.md is missing ${promise}`);
     }
 });

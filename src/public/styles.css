@@ -203,6 +203,80 @@
   color: #8c3b1e;
 }
 
+/* --- output guard -------------------------------------------------------- */
+
+/*
+ * A blocked reply. Deliberately conspicuous: the panel is showing something the
+ * system refused to say, which is the most interesting thing on the screen when
+ * it happens.
+ */
+.guard-block {
+  border: 1px solid #d8a893;
+  border-left: 3px solid #8c3b1e;
+  background: #fdf1ec;
+  border-radius: 4px;
+  padding: 5px 7px;
+  animation: slide-in 0.3s ease-out;
+}
+
+.guard-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #fff;
+  background: #8c3b1e;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.guard-rule {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: #8c3b1e;
+  border: 1px solid #d8a893;
+  background: #fff;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+/* The blocked draft, digits masked. Monospace so the masking is visible. */
+.guard-draft {
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-size: 9.5px;
+  line-height: 1.4;
+  color: #7a3419;
+  background: #fff;
+  border: 1px dashed #d8a893;
+  border-radius: 3px;
+  padding: 3px 5px;
+  margin-top: 4px;
+  word-break: break-word;
+}
+
+/* --- the standing limits ------------------------------------------------- */
+
+.never-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: #3d3a35;
+}
+
+.never-num {
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  color: #1f6f43;
+  border: 1px solid #b8e0c8;
+  background: #eef7f1;
+  border-radius: 2px;
+  min-width: 13px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
 /* --- flags --------------------------------------------------------------- */
 
 .flag {

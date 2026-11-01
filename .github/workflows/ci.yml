@@ -1,0 +1,156 @@
+# Chakravyuh CI.
+#
+# Three jobs, in the order they are worth failing in:
+#
+#   test        the unit suite - 500+ tests, no network, no external MongoDB
+#   demo        boots the real server and replays docs/DEMO.md over HTTP
+#   secrets     fails if an API key is ever committed again
+#
+# The `demo` job is the one that matters most. The unit suite proves the parts
+# work; the replay proves the seven beats a judge is actually shown work, in
+# order, against a server that is really listening.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unit tests (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the floor declared in package.json engines; 22 is what
+        # development actually runs on. Both have to stay green.
+        node: ['20.x', '22.x']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `npm ci` rather than `npm install`: it installs exactly the lockfile
+      # and fails if package.json and the lock have drifted, which is the
+      # check we want on every push.
+      - run: npm ci
+
+      # mongodb-memory-server downloads a mongod binary on first use. Caching
+      # it keeps the suite near its local runtime instead of paying for the
+      # download on every job.
+      - name: Cache the in-process MongoDB binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongo-binaries-${{ runner.os }}
+
+      - name: Unit suite
+        run: npm test
+        env:
+          # The suite builds its own config, but config.test.js reads the real
+          # environment in one place and an unset key fails it for the wrong
+          # reason.
+          API_SECRET_KEY: ci-placeholder-key-not-a-secret
+          MONGO_URI: ''
+
+      - name: Red-team suite
+        run: npm run redteam
+        env:
+          API_SECRET_KEY: ci-placeholder-key-not-a-secret
+          MONGO_URI: ''
+
+  demo:
+    name: demo replay (acceptance)
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Cache the in-process MongoDB binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongo-binaries-${{ runner.os }}
+
+      # FAKE_LLM=1 so CI never needs a model key and never makes a network
+      # call to one. MONGO_URI empty so it never needs a database service.
+      - name: Start the seeded server
+        run: npm run demo &
+        env:
+          API_SECRET_KEY: ci-placeholder-key-not-a-secret
+          MONGO_URI: ''
+          FAKE_LLM: '1'
+          DEMO_MODE: '1'
+          PORT: '8080'
+
+      - name: Wait for health
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then
+              echo "up after ${attempt}s"
+              curl -s http://localhost:8080/health
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the server never became healthy"
+          exit 1
+
+      # Exits non-zero if any of the 67 checks fails, which is the point.
+      - name: Replay docs/DEMO.md
+        run: npm run demo:replay
+
+  secrets:
+    name: no committed secrets
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history, not just the tip: a key committed and then
+          # deleted is still a leaked key, and that is exactly how this
+          # repository's original 24 keys got out.
+          fetch-depth: 0
+
+      - name: Scan the full history for API keys
+        run: |
+          set +e
+          PATTERN='(sk-[A-Za-z0-9_-]{16,}|sk-v1-[A-Za-z0-9]{8,}|AIza[0-9A-Za-z_-]{30,})'
+          HITS=$(git grep -InE "$PATTERN" $(git rev-list --all) -- \
+                   ':!package-lock.json' ':!*.pdf' 2>/dev/null)
+          if [ -n "$HITS" ]; then
+            echo "::error::An API key appears in the git history."
+            echo "$HITS" | sed -E 's/(sk-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+/\1.../g' | head -40
+            echo ""
+            echo "Revoke every key shown above, then strip them from history"
+            echo "with git-filter-repo. See the README's security notes."
+            exit 1
+          fi
+          echo "No API keys found in any reachable commit."
+
+      - name: No .env committed
+        run: |
+          if git ls-files --error-unmatch .env > /dev/null 2>&1; then
+            echo "::error::.env is tracked. It must never be committed."
+            exit 1
+          fi
+          echo ".env is not tracked."

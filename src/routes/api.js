@@ -69,6 +69,16 @@ const toSessionView = (session) => ({
     entities: session.entities,
     scriptStages: session.scriptStages,
     agentNotes: session.agentNotes,
+
+    // What the output guard refused to send, with the rule each draft broke.
+    guardBlocks: (session.guardLog || []).map((entry) => ({
+        at: entry.at,
+        messageId: entry.messageId,
+        attempt: entry.attempt,
+        ruleIds: entry.ruleIds,
+        reasons: entry.reasons,
+        redactedDraft: entry.redactedDraft,
+    })),
     messages: session.messages.map((m) => ({
         messageId: m.messageId,
         role: m.role,
@@ -461,4 +471,6 @@ const createRouter = (deps) => {
     return router;
 };
 
-module.exports = { createRouter, toSessionView };
+// SCENARIOS is exported so the seed script can print the same openers the
+// console's buttons use, rather than keeping a second copy that drifts.
+module.exports = { createRouter, toSessionView, SCENARIOS };

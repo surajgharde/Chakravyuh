@@ -34,6 +34,8 @@
         finished: false,
         seenIdentifiers: new Set(),
         scenarios: [],
+        // How many drafts the output guard has refused this session.
+        guardBlockCount: 0,
     };
 
     const $ = (id) => document.getElementById(id);
@@ -43,6 +45,7 @@
         connDot: $('conn-dot'),
         connLabel: $('conn-label'),
         llmBadge: $('llm-badge'),
+        fakeLlmBadge: $('fake-llm-badge'),
         demoBadge: $('demo-badge'),
         callBadge: $('call-badge'),
         judgeMode: $('judge-mode'),
@@ -98,6 +101,14 @@
         decoySource: $('decoy-source'),
         decoyFlags: $('decoy-flags'),
         decisions: $('decisions'),
+        guardBlocks: $('guard-blocks'),
+        guardCount: $('guard-count'),
+        neverList: $('never-list'),
+        btnEthics: $('btn-ethics'),
+        ethicsModal: $('ethics-modal'),
+        ethicsList: $('ethics-list'),
+        ethicsRetention: $('ethics-retention'),
+        btnEthicsClose: $('btn-ethics-close'),
         intelLiveWrap: $('intel-live-wrap'),
         intelLive: $('intel-live'),
         intelLiveMeta: $('intel-live-meta'),
@@ -466,6 +477,199 @@
     };
 
     // ---------------------------------------------------------------------
+    // The output guard
+    // ---------------------------------------------------------------------
+
+    /**
+     * The standing limits, shown on screen rather than only in ETHICS.md.
+     *
+     * `rule` names where each one is actually enforced, because a list of
+     * promises is worth very little next to a list of rules that run. The ids
+     * are the real rule ids in src/agents/outputGuard.js, so a blocked reply
+     * above lines up with the item it broke.
+     */
+    const NEVER_DO = [
+        {
+            short: 'Never move money',
+            full: 'Never move money. No payment, transfer, deposit or approval, in any amount, '
+                + 'for any reason — including a "₹1 test transaction".',
+            rule: 'payment_claim',
+        },
+        {
+            short: 'Never share identifiers, real or fake',
+            full: 'Never share identifiers, real or fake. No OTP, PIN, CVV, card, account, UPI id, '
+                + 'IFSC, Aadhaar, PAN, phone number or wallet. Not a real one, and not an '
+                + 'invented one either.',
+            rule: 'credential_leak',
+        },
+        {
+            short: 'Never click links or install apps',
+            full: 'Never click a link or install an app. No URL opened, no APK downloaded, no '
+                + 'remote-access tool run, no screen shared.',
+            rule: 'link_or_install',
+        },
+        {
+            short: 'Never impersonate officials',
+            full: 'Never impersonate an official. The persona is a private individual who does '
+                + 'not exist, and never claims to be police, a bank, a courier or a government officer.',
+            rule: 'official_impersonation',
+        },
+        {
+            short: 'Never threaten or harass',
+            full: 'Never threaten or harass. No threats, no abuse, no retaliation, however the '
+                + 'scammer behaves.',
+            rule: 'threat_or_abuse',
+        },
+        {
+            short: 'Never contact the scammer outside the thread',
+            full: 'Never contact the scammer outside the existing thread. The decoy only replies '
+                + 'in the conversation the scammer started; there is no outbound path in the code.',
+            rule: 'no outbound capability',
+        },
+        {
+            short: 'Never bait a trusted contact',
+            full: 'Never bait a trusted contact. A number on the protected user’s trusted list '
+                + 'is never engaged, whatever the message scores.',
+            rule: 'guardian trusted-contact veto',
+        },
+        {
+            short: 'Never export a report without human review',
+            full: 'Never export a report as ready to file without human review. It stays a draft '
+                + 'until a family member has read it and said so.',
+            rule: 'report.pdf?ready=1 returns 409',
+        },
+        {
+            short: "Never put the user's personal data in a report",
+            full: 'Never put the elderly user’s personal data in a report. No real name, number '
+                + 'or address of the protected user appears in an exported document.',
+            rule: 'real_person_data',
+        },
+    ];
+
+    /** Human labels for the guard's rule ids. */
+    const GUARD_RULE_LABELS = {
+        credential_leak: 'credential or identifier',
+        link_or_install: 'link, app or remote access',
+        payment_claim: 'claimed a payment was made',
+        threat_or_abuse: 'threat or abuse',
+        official_impersonation: 'impersonated an official',
+        persona_break: 'revealed it is software',
+        real_person_data: "a real person's data",
+        followed_injected_instruction: 'obeyed an injected instruction',
+        bank_named: 'named a real bank',
+        too_long: 'too long to sound spoken',
+        empty: 'empty draft',
+    };
+
+    const renderNeverList = () => {
+        el.neverList.innerHTML = '';
+        NEVER_DO.forEach((item, index) => {
+            const row = document.createElement('li');
+            row.className = 'never-row';
+
+            const number = document.createElement('span');
+            number.className = 'never-num';
+            number.textContent = index + 1;
+
+            const text = document.createElement('span');
+            text.textContent = item.short;
+
+            row.append(number, text);
+            row.title = `${item.full}  [enforced by: ${item.rule}]`;
+            el.neverList.append(row);
+        });
+    };
+
+    const renderEthicsModal = () => {
+        el.ethicsList.innerHTML = '';
+        NEVER_DO.forEach((item, index) => {
+            const row = document.createElement('li');
+            row.className = 'flex gap-2.5';
+
+            const number = document.createElement('span');
+            number.className = 'never-num mt-0.5';
+            number.textContent = index + 1;
+
+            const body = document.createElement('div');
+            const full = document.createElement('div');
+            full.textContent = item.full;
+            const where = document.createElement('div');
+            where.className = 'text-[10.5px] text-muted mt-0.5';
+            where.textContent = `enforced by: ${item.rule}`;
+            body.append(full, where);
+
+            row.append(number, body);
+            el.ethicsList.append(row);
+        });
+    };
+
+    /**
+     * Every decoy draft the guard refused this session.
+     *
+     * Appended to rather than rebuilt, because a block is an event: a panel
+     * that only showed the latest turn's blocks would make a reply that was
+     * caught two turns ago disappear, and the record of what the system
+     * declined to say is the whole point of showing it.
+     */
+    const addGuardBlocks = (blocks) => {
+        if (!blocks || blocks.length === 0) return;
+
+        if (el.guardBlocks.querySelector('.italic')) el.guardBlocks.innerHTML = '';
+
+        for (const block of blocks) {
+            state.guardBlockCount += 1;
+
+            const node = document.createElement('div');
+            node.className = 'guard-block';
+
+            const head = document.createElement('div');
+            head.className = 'flex items-baseline gap-1.5 flex-wrap';
+
+            const badge = document.createElement('span');
+            badge.className = 'guard-badge';
+            badge.textContent = 'BLOCKED';
+            head.append(badge);
+
+            for (const id of block.ruleIds || []) {
+                const rule = document.createElement('span');
+                rule.className = 'guard-rule';
+                rule.textContent = GUARD_RULE_LABELS[id] || id;
+                rule.title = id;
+                head.append(rule);
+            }
+
+            const attempt = document.createElement('span');
+            attempt.className = 'text-[9.5px] text-muted ml-auto';
+            attempt.textContent = `draft ${block.attempt}`;
+            head.append(attempt);
+
+            node.append(head);
+
+            const why = document.createElement('div');
+            why.className = 'text-[10px] leading-snug mt-1';
+            why.textContent = (block.reasons || []).join(' ');
+            node.append(why);
+
+            if (block.redactedDraft) {
+                const draft = document.createElement('div');
+                draft.className = 'guard-draft';
+                draft.textContent = block.redactedDraft;
+                draft.title = 'The blocked draft, with every digit masked and links removed. '
+                    + 'It was blocked because of what was in it, so it is never stored verbatim.';
+                node.append(draft);
+            }
+
+            el.guardBlocks.append(node);
+        }
+
+        el.guardCount.textContent = state.guardBlockCount;
+        el.guardBlocks.scrollTop = el.guardBlocks.scrollHeight;
+
+        toast(`Output guard blocked a reply: ${(blocks[0].ruleIds || []).join(', ')}. `
+            + 'The decoy wrote another one.', 'warn', 7000);
+    };
+
+    // ---------------------------------------------------------------------
     // The clock
     // ---------------------------------------------------------------------
 
@@ -516,6 +720,7 @@
         renderDecoy(turn.decoy);
         renderAlerts(turn.alerts);
         showTakeover(turn.takeoverNotice);
+        addGuardBlocks(turn.decoy && turn.decoy.guardBlocks);
 
         state.engaged = guardianState === 'DECOY_ACTIVE';
         el.btnGenuine.disabled = !state.engaged;
@@ -1193,6 +1398,9 @@
         el.phoneAlerts.innerHTML = '';
         el.scammerLog.innerHTML = '';
         el.decisions.innerHTML = '<div class="text-[11px] text-muted italic font-sans">Nothing yet.</div>';
+        el.guardBlocks.innerHTML = '<div class="text-[11px] text-muted italic">Nothing blocked. Every reply passed.</div>';
+        el.guardCount.textContent = '0';
+        state.guardBlockCount = 0;
         el.phoneCaller.textContent = 'No call';
         el.phoneChannel.textContent = '—';
         el.phoneClock.textContent = '00:00';
@@ -1400,6 +1608,9 @@
         }
     });
 
+    el.btnEthics.addEventListener('click', () => el.ethicsModal.classList.remove('hidden'));
+    el.btnEthicsClose.addEventListener('click', () => el.ethicsModal.classList.add('hidden'));
+
     el.btnReport.addEventListener('click', () => openReport().catch((e) => toast(`Report failed: ${e.message}`, 'bad')));
     el.btnPdf.addEventListener('click', downloadPdf);
     el.btnNetwork.addEventListener('click', openNetwork);
@@ -1418,6 +1629,7 @@
         if (event.key !== 'Escape') return;
         el.networkModal.classList.add('hidden');
         el.reportModal.classList.add('hidden');
+        el.ethicsModal.classList.add('hidden');
         // Escape is what anyone reaches for when a synthetic voice will not
         // stop. It silences the decoy without ending the call.
         if (engine && engine.speaker.speaking) engine.speaker.cancel();
@@ -1446,10 +1658,26 @@
                     el.llmBadge.classList.remove('hidden');
                 }
                 if (config.demoMode) el.demoBadge.classList.remove('hidden');
+
+                // Said on screen for as long as it is on. The decoy reports
+                // source: "llm" either way, because the reply did come through
+                // the model seam - so without this badge a judge would have no
+                // way to tell a scripted reply from a generated one, and the
+                // whole point of labelling the fallback would be undone.
+                if (config.fakeLlm) {
+                    el.fakeLlmBadge.classList.remove('hidden');
+                    toast('FAKE_LLM is on: every reply is scripted, with no network. '
+                        + 'Nothing on this screen is model-generated.', 'warn', 9000);
+                }
                 if (config.thresholds) {
                     el.thDecoy.textContent = config.thresholds.decoy;
                     el.thSusp.textContent = config.thresholds.suspicious;
                     el.scoreMark.style.left = `${config.thresholds.decoy}%`;
+                }
+                if (typeof config.sessionRetentionDays === 'number') {
+                    el.ethicsRetention.textContent = config.sessionRetentionDays === 0
+                        ? 'never (SESSION_RETENTION_DAYS=0)'
+                        : config.sessionRetentionDays;
                 }
             }
         } catch (error) {
@@ -1470,6 +1698,8 @@
 
         connect();
         wireCallMode();
+        renderNeverList();
+        renderEthicsModal();
         renderState('MONITORING');
         setStatus('MONITORING');
         renderScore(0, [], { label: '—', reasons: [] }, null);
